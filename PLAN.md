@@ -17,11 +17,11 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 ## 2. Key design decisions (recommended)
 | Area | Choice | Why |
 |---|---|---|
-| SQL parser | `sqlparser-rs` (MySQL dialect) to start | custom parser = months + bug/fuzz surface; can replace later |
+| SQL parser | **custom** (hand-written recursive descent, user decision) | must be fuzzed from day 1 |
 | Wire protocol | own implementation (reference `opensrv-mysql`) | core product; must be fuzzed |
 | Storage | B+Tree, 16 KiB pages, checksums (CRC32C/xxh3), WAL + full-page-image on first write after checkpoint | torn-page protection |
 | Txn | MVCC (undo log), snapshot isolation first, then RR/RC like InnoDB | |
-| Consensus | `openraft` crate | hand-rolled Raft is the #1 source of split-brain bugs |
+| Consensus | **custom Raft** (user decision) | highest-risk component: needs deterministic simulation tests + partition testing |
 | Encryption at rest | per-file DEK, AES-256-GCM with **deterministic nonce = (page_id, write counter)** or XChaCha20-Poly1305; AAD = file id + page id + LSN | see §4 |
 | Auth (SQL) | `caching_sha2_password` + TLS required; Argon2id for dashboard/REST | see §4 |
 | Licence | clean-room; do NOT copy MySQL/MariaDB (GPL) source | legal |
@@ -34,7 +34,7 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 **Stage 5 — transactions**: MVCC, BEGIN/COMMIT/ROLLBACK, deadlock detection, group commit, isolation tests.
 **Stage 6 — joins/aggregates/planner**: JOIN, GROUP BY, HAVING, subqueries, cost-based index selection, query timeout/cancel (KILL).
 **Stage 7 — ops**: Docker image, systemd unit, backup/restore + PITR, Prometheus metrics.
-**Stage 8 — replication/cluster (openraft)**: 3-node, leader election, log replication, join tokens, mTLS, partition tests (Jepsen-style).
+**Stage 8 — replication/cluster (custom Raft)**: 3-node, leader election, log replication, join tokens, mTLS, partition tests (Jepsen-style).
 **Stage 9 — Control dashboard + Identity** (Argon2id, TOTP, passkeys, Discord/GitHub OAuth, audit log).
 **Stage 10 — REST/WebSocket + SDKs**, then website/docs.
 **Later / separate project**: Windows installer, Kubernetes/Helm, NovaDB Cloud + billing, stored procedures, triggers, LSM engine.
@@ -62,9 +62,9 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 20. **Name** — check "NovaDB" trademark/existing products before public website/branding.
 
 ## 5. Open questions for the user
-- Build on this VPS (shares CPU with FiveM) or a separate dev box?
-- Private GitHub repo under EWANZO101?
-- OK to use sqlparser-rs + openraft crates (still our own engine), or fully custom from day 1?
+- ~~Build host~~ -> Docker container `novadb-builder` on this VPS, capped 2 CPU / 3 GB (see docker/README.md).
+- ~~Crates~~ -> everything custom (parser, protocol, storage, Raft). Third-party crates only for primitives: tokio, crypto (RustCrypto/ring), rustls, argon2, zstd.
+- Repo stays private until decided otherwise.
 
 ## 6. Working rules (from the user, 2026-11-13)
 - **Nothing is kept on the server.** All source and build files are written straight to this GitHub repo (work in a temp dir, commit + push, then delete it).
