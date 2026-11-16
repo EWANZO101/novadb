@@ -45,7 +45,11 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { cache_pages: 2048, checkpoint_wal_bytes: 64 << 20, create_if_missing: true }
+        Options {
+            cache_pages: 2048,
+            checkpoint_wal_bytes: 64 << 20,
+            create_if_missing: true,
+        }
     }
 }
 
@@ -55,6 +59,7 @@ struct Meta {
     freelist_head: PageId,
     free_count: u64,
     next_tree_id: u64,
+    db_id: u64,
 }
 
 impl Meta {
@@ -67,16 +72,21 @@ impl Meta {
         put_u64(b, 24, self.freelist_head);
         put_u64(b, 32, self.free_count);
         put_u64(b, 40, self.next_tree_id);
+        put_u64(&mut p[..], page::META_DB_ID_OFFSET, self.db_id);
     }
 
     fn decode(p: &[u8; PAGE_SIZE]) -> Result<Meta> {
         let b = &p[HEADER_SIZE..];
         if b[..8] != META_MAGIC {
-            return Err(Error::corrupt("meta page: bad magic (not a NovaDB data file?)"));
+            return Err(Error::corrupt(
+                "meta page: bad magic (not a NovaDB data file?)",
+            ));
         }
         let v = get_u32(b, 8);
         if v != FORMAT_VERSION {
-            return Err(Error::corrupt(format!("meta page: unsupported format version {v}")));
+            return Err(Error::corrupt(format!(
+                "meta page: unsupported format version {v}"
+            )));
         }
         if get_u32(b, 12) != PAGE_SIZE as u32 {
             return Err(Error::corrupt("meta page: page size mismatch"));
@@ -86,6 +96,7 @@ impl Meta {
             freelist_head: get_u64(b, 24),
             free_count: get_u64(b, 32),
             next_tree_id: get_u64(b, 40),
+            db_id: page::meta_db_id(p),
         };
         if m.page_count < 2
             || m.page_count > MAX_PAGE_ID + 1
@@ -93,8 +104,11 @@ impl Meta {
             || m.freelist_head == 1
             || m.free_count >= m.page_count
             || m.next_tree_id <= CATALOG_TREE_ID
+            || m.next_tree_id >= 1 << 62
         {
-            return Err(Error::corrupt(format!("meta page: inconsistent values {m:?}")));
+            return Err(Error::corrupt(format!(
+                "meta page: inconsistent values {m:?}"
+            )));
         }
         Ok(m)
     }
@@ -175,6 +189,11 @@ fn new_salt(avoid: u32) -> u32 {
     if s == avoid { s ^ 1 } else { s }
 }
 
+fn new_db_id() -> u64 {
+    let id = (u64::from(new_salt(0)) << 32) | u64::from(new_salt(1));
+    if id == 0 { 1 } else { id }
+}
+
 /// Atomically install a fresh WAL generation (tmp file + fsync + rename + dir fsync).
 fn install_wal(vfs: &dyn Vfs, h: WalHeader) -> Result<Box<dyn VfsFile>> {
     vfs.remove(WAL_TMP)?;
@@ -189,13 +208,19 @@ fn install_wal(vfs: &dyn Vfs, h: WalHeader) -> Result<Box<dyn VfsFile>> {
 }
 
 /// Create a fresh data file atomically.
-fn create_data(vfs: &dyn Vfs) -> Result<()> {
+fn create_data(vfs: &dyn Vfs, db_id: u64) -> Result<()> {
     vfs.remove(DATA_TMP)?;
     let mut pager = Pager::new(vfs.open(DATA_TMP, true)?);
     let mut p0 = new_page_buf();
     page::init_page(&mut p0, 0, PageType::Meta);
-    Meta { page_count: 2, freelist_head: 0, free_count: 0, next_tree_id: CATALOG_TREE_ID + 1 }
-        .encode(&mut p0);
+    Meta {
+        page_count: 2,
+        freelist_head: 0,
+        free_count: 0,
+        next_tree_id: CATALOG_TREE_ID + 1,
+        db_id,
+    }
+    .encode(&mut p0);
     pager.write(0, &mut p0)?;
     let mut p1 = new_page_buf();
     page::init_page(&mut p1, CATALOG_ROOT, PageType::Leaf);
@@ -235,7 +260,9 @@ impl Db {
             )));
         }
         if opts.checkpoint_wal_bytes < 64 * 1024 {
-            return Err(Error::InvalidArgument("checkpoint_wal_bytes must be >= 64 KiB".into()));
+            return Err(Error::InvalidArgument(
+                "checkpoint_wal_bytes must be >= 64 KiB".into(),
+            ));
         }
         let lock = vfs.lock()?.ok_or(Error::Locked)?;
         vfs.remove(DATA_TMP)?;
@@ -245,18 +272,29 @@ impl Db {
                 if !opts.create_if_missing {
                     return Err(Error::NotFound);
                 }
-                install_wal(&*vfs, WalHeader { salt: new_salt(0), start_lsn: 1 })?;
-                create_data(&*vfs)?;
+                let db_id = new_db_id();
+                install_wal(
+                    &*vfs,
+                    WalHeader {
+                        salt: new_salt(0),
+                        start_lsn: 1,
+                        db_id,
+                    },
+                )?;
+                create_data(&*vfs, db_id)?;
             }
             (false, true) => {
                 // Crash during creation leaves a WAL without commits; anything else means the
                 // data file was lost and we must not silently start over.
                 let mut w = vfs.open(WAL_FILE, false)?;
                 if wal_has_commits(&mut *w)? || !opts.create_if_missing {
-                    return Err(Error::corrupt("data file missing but WAL has committed records"));
+                    return Err(Error::corrupt(
+                        "data file missing but WAL has committed records",
+                    ));
                 }
+                let (_, h) = WalScanner::open(&mut *w)?;
                 drop(w);
-                create_data(&*vfs)?;
+                create_data(&*vfs, h.db_id)?;
             }
             (true, false) => {
                 return Err(Error::corrupt(
@@ -267,22 +305,30 @@ impl Db {
         }
 
         let mut pager = Pager::new(vfs.open(DATA_FILE, false)?);
-        let (report, old_salt) = {
+        let (report, old) = {
             let mut w = vfs.open(WAL_FILE, false)?;
             let rep = recovery::recover(&mut *w, &mut pager)?;
             let (_, h) = WalScanner::open(&mut *w)?;
-            (rep, h.salt)
+            (rep, h)
         };
-        // Start a new WAL generation; the old one has been fully applied and synced.
-        let salt = new_salt(old_salt);
-        let header = WalHeader { salt, start_lsn: report.next_lsn };
-        let wal_file = install_wal(&*vfs, header)?;
-
         let mut p0 = new_page_buf();
         if pager.read(0, &mut p0)? != PageType::Meta {
             return Err(Error::corrupt("page 0 is not a meta page"));
         }
         let meta = Meta::decode(&p0)?;
+        if meta.db_id != old.db_id {
+            return Err(Error::corrupt(
+                "WAL and data file belong to different databases",
+            ));
+        }
+        // Start a new WAL generation; the old one has been fully applied and synced.
+        let salt = new_salt(old.salt);
+        let header = WalHeader {
+            salt,
+            start_lsn: report.next_lsn,
+            db_id: meta.db_id,
+        };
+        let wal_file = install_wal(&*vfs, header)?;
         let file_pages = pager.file_pages()?;
         if file_pages < meta.page_count {
             return Err(Error::corrupt(format!(
@@ -341,7 +387,13 @@ impl Db {
     pub fn begin(&mut self) -> Result<Tx<'_>> {
         self.ensure_ok()?;
         let meta = self.meta;
-        Ok(Tx { db: self, before: HashMap::new(), meta_before: meta, failed: false, done: false })
+        Ok(Tx {
+            db: self,
+            before: HashMap::new(),
+            meta_before: meta,
+            failed: false,
+            done: false,
+        })
     }
 
     /// Run `f` in a transaction and commit if it returns `Ok`.
@@ -372,7 +424,11 @@ impl Db {
         self.pool.flush_all(&mut self.pager)?;
         self.pager.sync()?;
         let salt = new_salt(self.wal_salt);
-        let h = WalHeader { salt, start_lsn: self.wal.next_lsn() };
+        let h = WalHeader {
+            salt,
+            start_lsn: self.wal.next_lsn(),
+            db_id: self.meta.db_id,
+        };
         let f = install_wal(&*self.vfs, h)?;
         self.wal = WalWriter::new(f, h);
         self.wal_salt = salt;
@@ -432,7 +488,9 @@ impl NodeStore for TreeCtx<'_, '_> {
         let owner = self.owner;
         let p = self.tx.page_mut(id)?;
         if page::page_owner(p) != owner {
-            return Err(Error::corrupt(format!("write to page {id} not owned by tree {owner}")));
+            return Err(Error::corrupt(format!(
+                "write to page {id} not owned by tree {owner}"
+            )));
         }
         node.encode_into(p)
     }
@@ -474,7 +532,10 @@ impl<'a> Tx<'a> {
         let db = &mut *self.db;
         match db.pool.fetch(&mut db.pager, id)? {
             Ok(s) => Ok(s),
-            Err(_) => Err(Error::TxnTooLarge { pages: self.before.len(), limit: self.pin_limit() }),
+            Err(_) => Err(Error::TxnTooLarge {
+                pages: self.before.len(),
+                limit: self.pin_limit(),
+            }),
         }
     }
 
@@ -487,7 +548,10 @@ impl<'a> Tx<'a> {
         let s = self.slot(id)?;
         if !self.before.contains_key(&id) {
             if self.before.len() >= self.pin_limit() {
-                return Err(Error::TxnTooLarge { pages: self.before.len() + 1, limit: self.pin_limit() });
+                return Err(Error::TxnTooLarge {
+                    pages: self.before.len() + 1,
+                    limit: self.pin_limit(),
+                });
             }
             let copy: PageBuf = Box::new(*self.db.pool.page(s));
             let dirty = self.db.pool.is_dirty(s);
@@ -512,7 +576,9 @@ impl<'a> Tx<'a> {
             }
             let next = get_u64(p, HEADER_SIZE);
             if next >= self.db.meta.page_count || next == head {
-                return Err(Error::corrupt(format!("free-list page {head}: bad next {next}")));
+                return Err(Error::corrupt(format!(
+                    "free-list page {head}: bad next {next}"
+                )));
             }
             let p = self.page_mut(head)?;
             page::init_page(p, head, PageType::Free);
@@ -526,7 +592,10 @@ impl<'a> Tx<'a> {
                 return Err(Error::InvalidArgument("database is full".into()));
             }
             if self.before.len() >= self.pin_limit() {
-                return Err(Error::TxnTooLarge { pages: self.before.len() + 1, limit: self.pin_limit() });
+                return Err(Error::TxnTooLarge {
+                    pages: self.before.len() + 1,
+                    limit: self.pin_limit(),
+                });
             }
             let mut buf = new_page_buf();
             page::init_page(&mut buf, id, PageType::Free);
@@ -535,7 +604,10 @@ impl<'a> Tx<'a> {
             let slot = match db.pool.install(&mut db.pager, id, buf)? {
                 Ok(s) => s,
                 Err(_) => {
-                    return Err(Error::TxnTooLarge { pages: self.before.len(), limit: self.pin_limit() });
+                    return Err(Error::TxnTooLarge {
+                        pages: self.before.len(),
+                        limit: self.pin_limit(),
+                    });
                 }
             };
             self.before.insert(id, None);
@@ -549,13 +621,19 @@ impl<'a> Tx<'a> {
 
     fn free(&mut self, id: PageId, owner: u64) -> Result<()> {
         if id <= CATALOG_ROOT {
-            return Err(Error::corrupt(format!("attempt to free reserved page {id}")));
+            return Err(Error::corrupt(format!(
+                "attempt to free reserved page {id}"
+            )));
         }
         let head = self.db.meta.freelist_head;
         let p = self.page_mut(id)?;
         match page::page_type(p) {
             Some(PageType::Leaf | PageType::Internal) if page::page_owner(p) == owner => {}
-            _ => return Err(Error::corrupt(format!("free of page {id}: not a node of tree {owner}"))),
+            _ => {
+                return Err(Error::corrupt(format!(
+                    "free of page {id}: not a node of tree {owner}"
+                )));
+            }
         }
         page::init_page(p, id, PageType::Free);
         put_u64(&mut p[..], HEADER_SIZE, head);
@@ -599,14 +677,25 @@ impl<'a> Tx<'a> {
     }
 
     fn catalog_get(&mut self, name: &str) -> Result<Option<Tree>> {
-        let v = btree::get(&mut self.ctx(CATALOG_TREE_ID), CATALOG_ROOT, name.as_bytes())?;
+        let v = btree::get(
+            &mut self.ctx(CATALOG_TREE_ID),
+            CATALOG_ROOT,
+            name.as_bytes(),
+        )?;
         let Some(v) = v else { return Ok(None) };
         if v.len() != 16 {
-            return Err(Error::corrupt(format!("catalog entry {name:?}: bad length")));
+            return Err(Error::corrupt(format!(
+                "catalog entry {name:?}: bad length"
+            )));
         }
-        let t = Tree { id: get_u64(&v, 0), root: get_u64(&v, 8) };
+        let t = Tree {
+            id: get_u64(&v, 0),
+            root: get_u64(&v, 8),
+        };
         if t.id <= CATALOG_TREE_ID || t.root <= CATALOG_ROOT || t.root >= self.db.meta.page_count {
-            return Err(Error::corrupt(format!("catalog entry {name:?}: bad values")));
+            return Err(Error::corrupt(format!(
+                "catalog entry {name:?}: bad values"
+            )));
         }
         Ok(Some(t))
     }
@@ -626,7 +715,12 @@ impl<'a> Tx<'a> {
             let mut v = Vec::with_capacity(16);
             v.extend_from_slice(&id.to_le_bytes());
             v.extend_from_slice(&root.to_le_bytes());
-            btree::insert(&mut tx.ctx(CATALOG_TREE_ID), CATALOG_ROOT, name.as_bytes(), &v)?;
+            btree::insert(
+                &mut tx.ctx(CATALOG_TREE_ID),
+                CATALOG_ROOT,
+                name.as_bytes(),
+                &v,
+            )?;
             Ok(Tree { id, root })
         })
     }
@@ -634,7 +728,8 @@ impl<'a> Tx<'a> {
     /// Look up an existing tree.
     pub fn open_tree(&mut self, name: &str) -> Result<Tree> {
         Self::check_name(name)?;
-        self.run(|tx| tx.catalog_get(name))?.ok_or_else(|| Error::TreeNotFound(name.to_string()))
+        self.run(|tx| tx.catalog_get(name))?
+            .ok_or_else(|| Error::TreeNotFound(name.to_string()))
     }
 
     /// Open a tree, creating it if missing.
@@ -662,11 +757,19 @@ impl<'a> Tx<'a> {
     /// Names of all trees, sorted.
     pub fn list_trees(&mut self) -> Result<Vec<String>> {
         let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-            .range_inner(Tree { id: CATALOG_TREE_ID, root: CATALOG_ROOT }, (Bound::Unbounded, Bound::Unbounded))?
+            .range_inner(
+                Tree {
+                    id: CATALOG_TREE_ID,
+                    root: CATALOG_ROOT,
+                },
+                (Bound::Unbounded, Bound::Unbounded),
+            )?
             .collect::<Result<_>>()?;
         entries
             .into_iter()
-            .map(|(k, _)| String::from_utf8(k).map_err(|_| Error::corrupt("catalog: non-UTF-8 name")))
+            .map(|(k, _)| {
+                String::from_utf8(k).map_err(|_| Error::corrupt("catalog: non-UTF-8 name"))
+            })
             .collect()
     }
 
@@ -694,12 +797,23 @@ impl<'a> Tx<'a> {
     }
 
     /// Ordered iteration over `range`.
-    pub fn range<'t>(&'t mut self, t: &Tree, range: impl RangeBounds<[u8]>) -> Result<RangeIter<'t, 'a>> {
-        let b = (bound_owned(range.start_bound()), bound_owned(range.end_bound()));
+    pub fn range<'t>(
+        &'t mut self,
+        t: &Tree,
+        range: impl RangeBounds<[u8]>,
+    ) -> Result<RangeIter<'t, 'a>> {
+        let b = (
+            bound_owned(range.start_bound()),
+            bound_owned(range.end_bound()),
+        );
         self.range_inner(*t, b)
     }
 
-    fn range_inner<'t>(&'t mut self, t: Tree, (start, end): (Bound<Vec<u8>>, Bound<Vec<u8>>)) -> Result<RangeIter<'t, 'a>> {
+    fn range_inner<'t>(
+        &'t mut self,
+        t: Tree,
+        (start, end): (Bound<Vec<u8>>, Bound<Vec<u8>>),
+    ) -> Result<RangeIter<'t, 'a>> {
         let seek: Vec<u8> = match &start {
             Bound::Included(k) | Bound::Excluded(k) => k.clone(),
             Bound::Unbounded => Vec::new(),
@@ -775,7 +889,11 @@ impl<'a> Tx<'a> {
                 .pool
                 .slot_of(id)
                 .ok_or_else(|| Error::corrupt(format!("internal: dirty page {id} not resident")))?;
-            let prev = self.before.get(&id).and_then(|b| b.as_ref()).map(|(p, _)| p);
+            let prev = self
+                .before
+                .get(&id)
+                .and_then(|b| b.as_ref())
+                .map(|(p, _)| p);
             if let Some(prev) = prev
                 && wal::diff_pages(prev, db.pool.page(slot)).is_empty()
             {
@@ -811,8 +929,12 @@ impl<'a> Tx<'a> {
             db.pool.unpin(id);
         }
         self.before.clear();
-        if db.wal.size() >= db.opts.checkpoint_wal_bytes {
-            db.checkpoint_inner()?;
+        if db.wal.size() >= db.opts.checkpoint_wal_bytes
+            && let Err(e) = db.checkpoint_inner()
+        {
+            // The transaction is already durable (WAL fsynced), so commit succeeded; the
+            // handle is poisoned and the next operation reports the checkpoint failure.
+            db.poison(&e);
         }
         Ok(())
     }
@@ -842,7 +964,9 @@ impl<'a> Tx<'a> {
             }
             let (w, b) = ((id / 64) as usize, id % 64);
             if seen[w] & (1 << b) != 0 {
-                return Err(Error::corrupt(format!("verify: page {id} referenced twice")));
+                return Err(Error::corrupt(format!(
+                    "verify: page {id} referenced twice"
+                )));
             }
             seen[w] |= 1 << b;
             Ok(())
@@ -866,7 +990,9 @@ impl<'a> Tx<'a> {
             mark(cur)?;
             let p = self.page(cur)?;
             if page::page_type(p) != Some(PageType::Free) {
-                return Err(Error::corrupt(format!("verify: free-list page {cur} not free")));
+                return Err(Error::corrupt(format!(
+                    "verify: free-list page {cur} not free"
+                )));
             }
             cur = get_u64(p, HEADER_SIZE);
             rep.free_pages += 1;
@@ -876,7 +1002,10 @@ impl<'a> Tx<'a> {
         }
         let used: u64 = seen.iter().map(|w| w.count_ones() as u64).sum();
         if used != n {
-            return Err(Error::corrupt(format!("verify: {} of {n} pages leaked", n - used)));
+            return Err(Error::corrupt(format!(
+                "verify: {} of {n} pages leaked",
+                n - used
+            )));
         }
         rep.used_pages = n - rep.free_pages;
         Ok(rep)
@@ -927,7 +1056,9 @@ impl Iterator for RangeIter<'_, '_> {
             }
             if self.steps == 0 {
                 self.finished = true;
-                return Some(Err(Error::corrupt("leaf chain longer than the file (cycle?)")));
+                return Some(Err(Error::corrupt(
+                    "leaf chain longer than the file (cycle?)",
+                )));
             }
             self.steps -= 1;
             let (id, owner) = (self.next, self.tree.id);
@@ -938,7 +1069,9 @@ impl Iterator for RangeIter<'_, '_> {
                 }
                 Ok(Node::Internal { .. }) => {
                     self.finished = true;
-                    return Some(Err(Error::corrupt(format!("leaf chain reaches internal page {id}"))));
+                    return Some(Err(Error::corrupt(format!(
+                        "leaf chain reaches internal page {id}"
+                    ))));
                 }
                 Err(e) => {
                     self.finished = true;

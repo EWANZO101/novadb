@@ -22,7 +22,9 @@ pub mod vfs;
 pub mod wal;
 
 pub use btree::{MAX_KEY_LEN, MAX_VALUE_LEN};
-pub use db::{DATA_FILE, Db, MAX_TREE_NAME, Options, RangeIter, Stats, Tree, Tx, VerifyReport, WAL_FILE};
+pub use db::{
+    DATA_FILE, Db, MAX_TREE_NAME, Options, RangeIter, Stats, Tree, Tx, VerifyReport, WAL_FILE,
+};
 pub use error::{Error, Result};
 pub use recovery::RecoveryReport;
 pub use vfs::{SimRng, SimVfs, StdVfs, Vfs, VfsFile};

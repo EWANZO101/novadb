@@ -114,6 +114,14 @@ pub fn set_page_owner(p: &mut [u8; PAGE_SIZE], owner: u64) {
     put_u64(p, 24, owner);
 }
 
+/// Offset of the database id inside the meta page (page 0).
+pub const META_DB_ID_OFFSET: usize = HEADER_SIZE + 48;
+
+/// Database id stored in a meta page.
+pub fn meta_db_id(p: &[u8; PAGE_SIZE]) -> u64 {
+    get_u64(p, META_DB_ID_OFFSET)
+}
+
 /// Set the page LSN.
 pub fn set_page_lsn(p: &mut [u8; PAGE_SIZE], lsn: u64) {
     put_u64(p, 16, lsn);
@@ -136,7 +144,9 @@ pub fn verify(p: &[u8; PAGE_SIZE], expected: PageId) -> Result<PageType> {
     }
     let id = page_id(p);
     if id != expected {
-        return Err(Error::corrupt(format!("page {expected}: header claims page id {id}")));
+        return Err(Error::corrupt(format!(
+            "page {expected}: header claims page id {id}"
+        )));
     }
     PageType::from_u8(p[4])
         .ok_or_else(|| Error::corrupt(format!("page {expected}: unknown page type {}", p[4])))

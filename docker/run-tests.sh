@@ -15,11 +15,15 @@ step "fmt"     cargo fmt --all -- --check
 step "build"   cargo build --workspace --all-targets --locked
 step "clippy"  cargo clippy --workspace --all-targets --locked -- -D warnings
 step "tests"   cargo nextest run --workspace --locked
+step "tests (release)" cargo test --workspace --release --locked
 step "doctest" cargo test --workspace --doc --locked
 step "audit"   cargo audit
 [ -f deny.toml ] && step "deny" cargo deny check
-if [ -d fuzz ]; then for t in $(cargo +nightly fuzz list 2>/dev/null); do
-  step "fuzz:$t (${FUZZ_SECS:-60}s)" cargo +nightly fuzz run "$t" -- -max_total_time="${FUZZ_SECS:-60}"; done; fi
+[ -x scripts/security-check.sh ] && step "security-check" scripts/security-check.sh
+# cargo-fuzz from binstall is a musl build and would default to the musl target: pass the host.
+HOST=$(rustc -vV | sed -n 's/^host: //p')
+if [ -d fuzz ]; then for t in $(cd fuzz && cargo +nightly fuzz list 2>/dev/null); do
+  step "fuzz:$t (${FUZZ_SECS:-60}s)" bash -c "cd fuzz && cargo +nightly fuzz run --target $HOST $t -- -max_total_time=${FUZZ_SECS:-60} -rss_limit_mb=2048"; done; fi
 [ -x scripts/crash-test.sh ] && step "crash-recovery" scripts/crash-test.sh
 cat $R; [ -d /out ] && cp $R /out/report.md
 exit $FAIL

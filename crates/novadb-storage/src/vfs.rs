@@ -19,8 +19,8 @@ pub trait VfsFile: Send {
     fn read_exact_at(&mut self, buf: &mut [u8], off: u64) -> io::Result<()>;
     /// Write all of `buf` at `off`, extending the file if needed.
     fn write_all_at(&mut self, buf: &[u8], off: u64) -> io::Result<()>;
-    /// Current length.
-    fn len(&mut self) -> io::Result<u64>;
+    /// Current length in bytes.
+    fn size(&mut self) -> io::Result<u64>;
     /// Truncate or extend.
     fn set_len(&mut self, len: u64) -> io::Result<()>;
     /// Make all previous writes durable (fsync).
@@ -47,11 +47,16 @@ fn check_name(name: &str) -> io::Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
         && !name.starts_with('.')
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-');
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-');
     if ok {
         Ok(())
     } else {
-        Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid file name"))
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid file name",
+        ))
     }
 }
 
@@ -125,7 +130,7 @@ impl VfsFile for StdFile {
         }
         Ok(())
     }
-    fn len(&mut self) -> io::Result<u64> {
+    fn size(&mut self) -> io::Result<u64> {
         Ok(self.0.metadata()?.len())
     }
     fn set_len(&mut self, len: u64) -> io::Result<()> {
@@ -174,7 +179,10 @@ impl Vfs for StdVfs {
     fn lock(&self) -> io::Result<Option<Box<dyn Any + Send>>> {
         let f = self.open("LOCK", true)?;
         drop(f);
-        let file = OpenOptions::new().read(true).write(true).open(self.path("LOCK")?)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.path("LOCK")?)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Box::new(file))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -193,8 +201,11 @@ pub struct MemFile(pub Vec<u8>);
 
 impl VfsFile for MemFile {
     fn read_exact_at(&mut self, buf: &mut [u8], off: u64) -> io::Result<()> {
-        let off = usize::try_from(off).map_err(|_| io::Error::from(io::ErrorKind::UnexpectedEof))?;
-        let end = off.checked_add(buf.len()).ok_or(io::ErrorKind::UnexpectedEof)?;
+        let off =
+            usize::try_from(off).map_err(|_| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        let end = off
+            .checked_add(buf.len())
+            .ok_or(io::ErrorKind::UnexpectedEof)?;
         let src = self.0.get(off..end).ok_or(io::ErrorKind::UnexpectedEof)?;
         buf.copy_from_slice(src);
         Ok(())
@@ -202,7 +213,7 @@ impl VfsFile for MemFile {
     fn write_all_at(&mut self, buf: &[u8], off: u64) -> io::Result<()> {
         write_vec(&mut self.0, buf, off)
     }
-    fn len(&mut self) -> io::Result<u64> {
+    fn size(&mut self) -> io::Result<u64> {
         Ok(self.0.len() as u64)
     }
     fn set_len(&mut self, len: u64) -> io::Result<()> {
@@ -224,7 +235,9 @@ fn to_usize(v: u64) -> io::Result<usize> {
 
 fn write_vec(v: &mut Vec<u8>, buf: &[u8], off: u64) -> io::Result<()> {
     let off = to_usize(off)?;
-    let end = off.checked_add(buf.len()).ok_or_else(|| io::Error::other("overflow"))?;
+    let end = off
+        .checked_add(buf.len())
+        .ok_or_else(|| io::Error::other("overflow"))?;
     to_usize(end as u64)?;
     if v.len() < end {
         v.resize(end, 0);
@@ -432,8 +445,13 @@ impl VfsFile for SimFile {
     fn read_exact_at(&mut self, buf: &mut [u8], off: u64) -> io::Result<()> {
         self.with(None, |i| {
             let off = usize::try_from(off).map_err(io::Error::other)?;
-            let end = off.checked_add(buf.len()).ok_or(io::ErrorKind::UnexpectedEof)?;
-            let src = i.current.get(off..end).ok_or(io::ErrorKind::UnexpectedEof)?;
+            let end = off
+                .checked_add(buf.len())
+                .ok_or(io::ErrorKind::UnexpectedEof)?;
+            let src = i
+                .current
+                .get(off..end)
+                .ok_or(io::ErrorKind::UnexpectedEof)?;
             buf.copy_from_slice(src);
             Ok(())
         })
@@ -441,11 +459,14 @@ impl VfsFile for SimFile {
     fn write_all_at(&mut self, buf: &[u8], off: u64) -> io::Result<()> {
         self.with(Some(false), |i| {
             write_vec(&mut i.current, buf, off)?;
-            i.pending.push(PendingOp::Write { off, data: buf.to_vec() });
+            i.pending.push(PendingOp::Write {
+                off,
+                data: buf.to_vec(),
+            });
             Ok(())
         })
     }
-    fn len(&mut self) -> io::Result<u64> {
+    fn size(&mut self) -> io::Result<u64> {
         self.with(None, |i| Ok(i.current.len() as u64))
     }
     fn set_len(&mut self, len: u64) -> io::Result<()> {
@@ -480,7 +501,10 @@ impl Vfs for SimVfs {
             }
             None => return Err(io::ErrorKind::NotFound.into()),
         };
-        Ok(Box::new(SimFile { st: self.st.clone(), ino }))
+        Ok(Box::new(SimFile {
+            st: self.st.clone(),
+            ino,
+        }))
     }
     fn exists(&self, name: &str) -> io::Result<bool> {
         check_name(name)?;
@@ -539,7 +563,10 @@ mod tests {
         f.write_all_at(b"hello", 0).unwrap();
         f.sync().unwrap();
         v.crash(&mut SimRng::new(1));
-        assert!(!v.exists("a").unwrap(), "file created without sync_dir must vanish");
+        assert!(
+            !v.exists("a").unwrap(),
+            "file created without sync_dir must vanish"
+        );
     }
 
     #[test]

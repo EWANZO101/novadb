@@ -8,16 +8,17 @@
 //! since the last checkpoint, which also repairs torn data-page writes.
 //!
 //! ```text
-//! file header (32 bytes):
-//!   0 magic "NOVAWAL\x01" | 8 version u32 | 12 salt u32 | 16 start_lsn u64 | 24 reserved u32
-//!  28 crc32c([0..28]) u32
+//! file header (40 bytes):
+//!   0 magic "NOVAWAL\x01" | 8 version u32 | 12 salt u32 | 16 start_lsn u64 | 24 db_id u64
+//!  32 reserved u32 | 36 crc32c([0..36]) u32
 //! record:
 //!   0 payload_len u32 | 4 crc32c(salt ‖ rec[8..20] ‖ payload) u32 | 8 lsn u64 | 16 kind u8
 //!  17 reserved [3] | 20 payload
 //! ```
 //!
 //! The per-generation random `salt` makes records from an older WAL generation (e.g. stale
-//! bytes after a truncate) fail the CRC, and LSNs must be strictly consecutive.
+//! bytes after a truncate) fail the CRC, and LSNs must be strictly consecutive. `db_id` ties
+//! the WAL to its data file (recovery refuses to replay a WAL from another database).
 
 use crate::crc32c::Crc32c;
 use crate::error::{Error, Result};
@@ -30,9 +31,11 @@ pub const WAL_MAGIC: [u8; 8] = *b"NOVAWAL\x01";
 /// WAL format version.
 pub const WAL_VERSION: u32 = 1;
 /// File header size.
-pub const WAL_HEADER_SIZE: usize = 32;
+pub const WAL_HEADER_SIZE: usize = 40;
 /// Record header size.
 pub const REC_HEADER_SIZE: usize = 20;
+/// LSNs must stay below this (2^62): ~146 years at 10^9 records/s.
+pub const MAX_LSN: u64 = 1 << 62;
 /// Largest legal payload (a full page image).
 pub const MAX_PAYLOAD: usize = 8 + PAGE_SIZE;
 
@@ -66,6 +69,8 @@ pub struct WalHeader {
     pub salt: u32,
     /// LSN of the first record.
     pub start_lsn: u64,
+    /// Random id of the database this WAL belongs to (also stored in the meta page).
+    pub db_id: u64,
 }
 
 impl WalHeader {
@@ -76,9 +81,10 @@ impl WalHeader {
         page::put_u32(&mut b, 8, WAL_VERSION);
         page::put_u32(&mut b, 12, self.salt);
         page::put_u64(&mut b, 16, self.start_lsn);
+        page::put_u64(&mut b, 24, self.db_id);
         let mut h = Crc32c::new();
-        h.update(&b[..28]);
-        page::put_u32(&mut b, 28, h.finish());
+        h.update(&b[..36]);
+        page::put_u32(&mut b, 36, h.finish());
         b
     }
 
@@ -91,15 +97,26 @@ impl WalHeader {
             return Err(Error::corrupt("WAL: bad magic"));
         }
         let mut h = Crc32c::new();
-        h.update(&b[..28]);
-        if h.finish() != get_u32(b, 28) {
+        h.update(&b[..36]);
+        if h.finish() != get_u32(b, 36) {
             return Err(Error::corrupt("WAL: header checksum mismatch"));
         }
         let v = get_u32(b, 8);
         if v != WAL_VERSION {
             return Err(Error::corrupt(format!("WAL: unsupported version {v}")));
         }
-        Ok(WalHeader { salt: get_u32(b, 12), start_lsn: get_u64(b, 16) })
+        let start_lsn = get_u64(b, 16);
+        // Leave LSN headroom so arithmetic on LSNs can never overflow.
+        if start_lsn == 0 || start_lsn >= MAX_LSN {
+            return Err(Error::corrupt(format!(
+                "WAL: start LSN {start_lsn} out of range"
+            )));
+        }
+        Ok(WalHeader {
+            salt: get_u32(b, 12),
+            start_lsn,
+            db_id: get_u64(b, 24),
+        })
     }
 }
 
@@ -150,7 +167,10 @@ pub fn diff_pages(old: &[u8; PAGE_SIZE], new: &[u8; PAGE_SIZE]) -> Vec<(u16, u16
         i = end;
     }
     // PAGE_SIZE (16384) fits in u16, so the casts are lossless.
-    ranges.into_iter().map(|(s, e)| (s as u16, (e - s) as u16)).collect()
+    ranges
+        .into_iter()
+        .map(|(s, e)| (s as u16, (e - s) as u16))
+        .collect()
 }
 
 /// Build a delta payload; `None` if it would be larger than a full image.
@@ -189,7 +209,9 @@ pub fn apply_delta(payload: &[u8], page: &mut [u8; PAGE_SIZE]) -> Result<PageId>
         if off < 4 || off + len > PAGE_SIZE {
             return Err(bad("range outside page"));
         }
-        let data = payload.get(pos..pos + len).ok_or_else(|| bad("truncated range data"))?;
+        let data = payload
+            .get(pos..pos + len)
+            .ok_or_else(|| bad("truncated range data"))?;
         page[off..off + len].copy_from_slice(data);
         pos += len;
     }
@@ -277,7 +299,7 @@ pub struct WalScanner<'f> {
 impl<'f> WalScanner<'f> {
     /// Read and validate the header, position at the first record.
     pub fn open(file: &'f mut dyn VfsFile) -> Result<(Self, WalHeader)> {
-        let len = file.len()?;
+        let len = file.size()?;
         let mut hb = [0u8; WAL_HEADER_SIZE];
         if len < WAL_HEADER_SIZE as u64 {
             return Err(Error::corrupt("WAL file shorter than its header"));
@@ -318,12 +340,13 @@ impl<'f> WalScanner<'f> {
             return stop(self);
         }
         self.payload.resize(plen, 0);
-        self.file.read_exact_at(&mut self.payload, self.pos + REC_HEADER_SIZE as u64)?;
+        self.file
+            .read_exact_at(&mut self.payload, self.pos + REC_HEADER_SIZE as u64)?;
         if record_crc(self.salt, &hdr[8..], &self.payload) != get_u32(&hdr, 4) {
             return stop(self);
         }
         let lsn = get_u64(&hdr, 8);
-        if lsn != self.expected_lsn {
+        if lsn != self.expected_lsn || lsn >= MAX_LSN {
             return stop(self);
         }
         // CRC matched: anything structurally wrong from here on is real corruption or a bug,
@@ -334,7 +357,12 @@ impl<'f> WalScanner<'f> {
             .checked_add(1)
             .ok_or_else(|| Error::corrupt("WAL: LSN overflow"))?;
         self.pos += (REC_HEADER_SIZE + plen) as u64;
-        Ok(Some(Record { kind, lsn, payload: &self.payload, end: self.pos }))
+        Ok(Some(Record {
+            kind,
+            lsn,
+            payload: &self.payload,
+            end: self.pos,
+        }))
     }
 }
 
@@ -346,7 +374,11 @@ mod tests {
 
     #[test]
     fn header_roundtrip_and_rejects_garbage() {
-        let h = WalHeader { salt: 0xDEAD_BEEF, start_lsn: 77 };
+        let h = WalHeader {
+            salt: 0xDEAD_BEEF,
+            start_lsn: 77,
+            db_id: 99,
+        };
         let b = h.encode();
         assert_eq!(WalHeader::decode(&b).unwrap(), h);
         for i in 0..WAL_HEADER_SIZE {
@@ -396,7 +428,14 @@ mod tests {
 
     fn wal_with(records: &[(RecordKind, &[u8])], salt: u32) -> MemFile {
         let mut f = MemFile::default();
-        f.0.extend_from_slice(&WalHeader { salt, start_lsn: 10 }.encode());
+        f.0.extend_from_slice(
+            &WalHeader {
+                salt,
+                start_lsn: 10,
+                db_id: 1,
+            }
+            .encode(),
+        );
         for (i, (k, p)) in records.iter().enumerate() {
             encode_record(&mut f.0, salt, 10 + i as u64, *k, p);
         }

@@ -29,7 +29,9 @@ impl Pager {
         match self.file.read_exact_at(&mut buf[..], off) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(Error::corrupt(format!("page {id} is beyond the end of the data file")));
+                return Err(Error::corrupt(format!(
+                    "page {id} is beyond the end of the data file"
+                )));
             }
             Err(e) => return Err(e.into()),
         }
@@ -58,6 +60,6 @@ impl Pager {
 
     /// Number of whole pages in the file.
     pub fn file_pages(&mut self) -> Result<u64> {
-        Ok(self.file.len()? / PAGE_SIZE as u64)
+        Ok(self.file.size()? / PAGE_SIZE as u64)
     }
 }

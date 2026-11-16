@@ -85,7 +85,13 @@ impl BufferPool {
     }
 
     fn place(&mut self, slot: usize, id: PageId, buf: PageBuf) {
-        let f = Frame { id, buf, dirty: false, pinned: false, referenced: true };
+        let f = Frame {
+            id,
+            buf,
+            dirty: false,
+            pinned: false,
+            referenced: true,
+        };
         if slot == self.frames.len() {
             self.frames.push(f);
         } else {

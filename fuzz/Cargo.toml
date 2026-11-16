@@ -1,0 +1,56 @@
+[package]
+name = "novadb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "LicenseRef-NovaDB-Proprietary"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+novadb-storage = { path = "../crates/novadb-storage" }
+
+# Not part of the main workspace (needs nightly + sanitizers).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[[bin]]
+name = "node_decode"
+path = "fuzz_targets/node_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_scan_raw"
+path = "fuzz_targets/wal_scan_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_replay"
+path = "fuzz_targets/wal_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "db_corrupt_open"
+path = "fuzz_targets/db_corrupt_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btree_model"
+path = "fuzz_targets/btree_model.rs"
+test = false
+doc = false
+bench = false

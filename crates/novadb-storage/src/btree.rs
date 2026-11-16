@@ -62,7 +62,11 @@ pub enum Node {
 }
 
 fn leaf_size(entries: &[(Vec<u8>, Vec<u8>)]) -> usize {
-    LEAF_FIXED + entries.iter().map(|(k, v)| LEAF_ENTRY + k.len() + v.len()).sum::<usize>()
+    LEAF_FIXED
+        + entries
+            .iter()
+            .map(|(k, v)| LEAF_ENTRY + k.len() + v.len())
+            .sum::<usize>()
 }
 
 fn internal_size(keys: &[Vec<u8>]) -> usize {
@@ -72,7 +76,10 @@ fn internal_size(keys: &[Vec<u8>]) -> usize {
 impl Node {
     /// Empty leaf.
     pub fn empty_leaf() -> Self {
-        Node::Leaf { next: 0, entries: Vec::new() }
+        Node::Leaf {
+            next: 0,
+            entries: Vec::new(),
+        }
     }
 
     /// Encoded body size in bytes.
@@ -176,7 +183,10 @@ impl Node {
                     keys.push(k.to_vec());
                     children.push(c);
                 }
-                if children.iter().any(|&c| c == 0 || c == id || c > MAX_PAGE_ID) {
+                if children
+                    .iter()
+                    .any(|&c| c == 0 || c == id || c > MAX_PAGE_ID)
+                {
                     return Err(bad("bad child pointer"));
                 }
                 Ok(Node::Internal { keys, children })
@@ -225,7 +235,11 @@ fn best_split(sz: &[usize], fixed: usize, skip_mid: bool) -> Result<usize> {
     let total: usize = sz.iter().sum();
     let mut best: Option<(usize, usize)> = None;
     let mut left = 0usize;
-    let (lo, hi) = if skip_mid { (0, sz.len()) } else { (1, sz.len()) };
+    let (lo, hi) = if skip_mid {
+        (0, sz.len())
+    } else {
+        (1, sz.len())
+    };
     for (m, &s) in sz.iter().enumerate().take(hi) {
         if m >= lo {
             let right = total - left - if skip_mid { s } else { 0 };
@@ -239,11 +253,15 @@ fn best_split(sz: &[usize], fixed: usize, skip_mid: bool) -> Result<usize> {
         }
         left += s;
     }
-    best.map(|(m, _)| m).ok_or_else(|| Error::corrupt("internal error: node cannot be split"))
+    best.map(|(m, _)| m)
+        .ok_or_else(|| Error::corrupt("internal error: node cannot be split"))
 }
 
 fn split_leaf_point(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<usize> {
-    let sz: Vec<usize> = entries.iter().map(|(k, v)| LEAF_ENTRY + k.len() + v.len()).collect();
+    let sz: Vec<usize> = entries
+        .iter()
+        .map(|(k, v)| LEAF_ENTRY + k.len() + v.len())
+        .collect();
     best_split(&sz, LEAF_FIXED, false)
 }
 
@@ -291,7 +309,11 @@ pub(crate) fn get(s: &mut impl NodeStore, root: PageId, key: &[u8]) -> Result<Op
 }
 
 /// Find the leaf that would contain `key`.
-pub(crate) fn seek_leaf(s: &mut impl NodeStore, root: PageId, key: &[u8]) -> Result<(PageId, Node)> {
+pub(crate) fn seek_leaf(
+    s: &mut impl NodeStore,
+    root: PageId,
+    key: &[u8],
+) -> Result<(PageId, Node)> {
     let mut id = root;
     for _ in 0..=MAX_DEPTH {
         let n = s.read_node(id)?;
@@ -330,11 +352,20 @@ fn insert_rec(
             let right = entries.split_off(m);
             let sep = right[0].0.clone();
             let rid = s.alloc_page()?;
-            s.write_node(rid, &Node::Leaf { next, entries: right })?;
+            s.write_node(
+                rid,
+                &Node::Leaf {
+                    next,
+                    entries: right,
+                },
+            )?;
             s.write_node(id, &Node::Leaf { next: rid, entries })?;
             Ok((old, Some((sep, rid))))
         }
-        Node::Internal { mut keys, mut children } => {
+        Node::Internal {
+            mut keys,
+            mut children,
+        } => {
             let idx = child_index(&keys, key);
             let (old, split) = insert_rec(s, children[idx], key, val, depth + 1)?;
             let Some((sep, rid)) = split else {
@@ -348,10 +379,18 @@ fn insert_rec(
             }
             let m = split_internal_point(&keys)?;
             let rkeys = keys.split_off(m + 1);
-            let up = keys.pop().ok_or_else(|| Error::corrupt("internal error: empty split"))?;
+            let up = keys
+                .pop()
+                .ok_or_else(|| Error::corrupt("internal error: empty split"))?;
             let rchildren = children.split_off(m + 1);
             let nid = s.alloc_page()?;
-            s.write_node(nid, &Node::Internal { keys: rkeys, children: rchildren })?;
+            s.write_node(
+                nid,
+                &Node::Internal {
+                    keys: rkeys,
+                    children: rchildren,
+                },
+            )?;
             s.write_node(id, &Node::Internal { keys, children })?;
             Ok((old, Some((up, nid))))
         }
@@ -372,7 +411,13 @@ pub(crate) fn insert(
         let left = s.read_node(root)?;
         let lid = s.alloc_page()?;
         s.write_node(lid, &left)?;
-        s.write_node(root, &Node::Internal { keys: vec![sep], children: vec![lid, rid] })?;
+        s.write_node(
+            root,
+            &Node::Internal {
+                keys: vec![sep],
+                children: vec![lid, rid],
+            },
+        )?;
     }
     Ok(old)
 }
@@ -387,14 +432,32 @@ fn rebalance(
     if children.len() < 2 {
         return Ok(());
     }
-    let li = if idx + 1 < children.len() { idx } else { idx - 1 };
+    let li = if idx + 1 < children.len() {
+        idx
+    } else {
+        idx - 1
+    };
     let ri = li + 1;
     let (lid, rid) = (children[li], children[ri]);
     match (s.read_node(lid)?, s.read_node(rid)?) {
-        (Node::Leaf { entries: mut le, .. }, Node::Leaf { next: rnext, entries: re }) => {
+        (
+            Node::Leaf {
+                entries: mut le, ..
+            },
+            Node::Leaf {
+                next: rnext,
+                entries: re,
+            },
+        ) => {
             le.extend(re);
             if leaf_size(&le) <= BODY_SIZE {
-                s.write_node(lid, &Node::Leaf { next: rnext, entries: le })?;
+                s.write_node(
+                    lid,
+                    &Node::Leaf {
+                        next: rnext,
+                        entries: le,
+                    },
+                )?;
                 s.free_page(rid)?;
                 keys.remove(li);
                 children.remove(ri);
@@ -402,30 +465,75 @@ fn rebalance(
                 let m = split_leaf_point(&le)?;
                 let right = le.split_off(m);
                 keys[li] = right[0].0.clone();
-                s.write_node(lid, &Node::Leaf { next: rid, entries: le })?;
-                s.write_node(rid, &Node::Leaf { next: rnext, entries: right })?;
+                s.write_node(
+                    lid,
+                    &Node::Leaf {
+                        next: rid,
+                        entries: le,
+                    },
+                )?;
+                s.write_node(
+                    rid,
+                    &Node::Leaf {
+                        next: rnext,
+                        entries: right,
+                    },
+                )?;
             }
         }
-        (Node::Internal { keys: mut lk, children: mut lc }, Node::Internal { keys: rk, children: rc }) => {
+        (
+            Node::Internal {
+                keys: mut lk,
+                children: mut lc,
+            },
+            Node::Internal {
+                keys: rk,
+                children: rc,
+            },
+        ) => {
             lk.push(keys[li].clone());
             lk.extend(rk);
             lc.extend(rc);
             if internal_size(&lk) <= BODY_SIZE {
-                s.write_node(lid, &Node::Internal { keys: lk, children: lc })?;
+                s.write_node(
+                    lid,
+                    &Node::Internal {
+                        keys: lk,
+                        children: lc,
+                    },
+                )?;
                 s.free_page(rid)?;
                 keys.remove(li);
                 children.remove(ri);
             } else {
                 let m = split_internal_point(&lk)?;
                 let rkeys = lk.split_off(m + 1);
-                let up = lk.pop().ok_or_else(|| Error::corrupt("internal error: empty split"))?;
+                let up = lk
+                    .pop()
+                    .ok_or_else(|| Error::corrupt("internal error: empty split"))?;
                 let rch = lc.split_off(m + 1);
                 keys[li] = up;
-                s.write_node(lid, &Node::Internal { keys: lk, children: lc })?;
-                s.write_node(rid, &Node::Internal { keys: rkeys, children: rch })?;
+                s.write_node(
+                    lid,
+                    &Node::Internal {
+                        keys: lk,
+                        children: lc,
+                    },
+                )?;
+                s.write_node(
+                    rid,
+                    &Node::Internal {
+                        keys: rkeys,
+                        children: rch,
+                    },
+                )?;
             }
         }
-        _ => return Err(Error::corrupt(format!("pages {lid} and {rid}: sibling kinds differ"))),
+        _ => {
+            return Err(Error::corrupt(format!(
+                "pages {lid} and {rid}: sibling kinds differ"
+            )));
+        }
     }
     Ok(())
 }
@@ -448,7 +556,10 @@ fn delete_rec(
             s.write_node(id, &Node::Leaf { next, entries })?;
             Ok(Some((v, size)))
         }
-        Node::Internal { mut keys, mut children } => {
+        Node::Internal {
+            mut keys,
+            mut children,
+        } => {
             let idx = child_index(&keys, key);
             let Some((v, child_size)) = delete_rec(s, children[idx], key, depth + 1)? else {
                 return Ok(None);
@@ -487,7 +598,11 @@ pub(crate) fn delete(s: &mut impl NodeStore, root: PageId, key: &[u8]) -> Result
 }
 
 /// Collect every page of the tree rooted at `root` (for drop/verify).
-pub(crate) fn collect_pages(s: &mut impl NodeStore, root: PageId, out: &mut Vec<PageId>) -> Result<()> {
+pub(crate) fn collect_pages(
+    s: &mut impl NodeStore,
+    root: PageId,
+    out: &mut Vec<PageId>,
+) -> Result<()> {
     fn rec(s: &mut impl NodeStore, id: PageId, out: &mut Vec<PageId>, depth: usize) -> Result<()> {
         depth_check(depth)?;
         out.push(id);
@@ -559,15 +674,28 @@ pub(crate) fn check(
                 }
                 c.stats.internals += 1;
                 for (i, &ch) in children.iter().enumerate() {
-                    let l = if i == 0 { lo } else { Some(keys[i - 1].as_slice()) };
-                    let h = if i == keys.len() { hi } else { Some(keys[i].as_slice()) };
+                    let l = if i == 0 {
+                        lo
+                    } else {
+                        Some(keys[i - 1].as_slice())
+                    };
+                    let h = if i == keys.len() {
+                        hi
+                    } else {
+                        Some(keys[i].as_slice())
+                    };
                     rec(s, c, ch, l, h, depth + 1)?;
                 }
             }
         }
         Ok(())
     }
-    let mut c = Ctx { stats: TreeStats::default(), leaves: Vec::new(), leaf_depth: None, seen };
+    let mut c = Ctx {
+        stats: TreeStats::default(),
+        leaves: Vec::new(),
+        leaf_depth: None,
+        seen,
+    };
     rec(s, &mut c, root, None, None, 0)?;
     for w in c.leaves.windows(2) {
         if w[0].1 != w[1].0 {
@@ -580,7 +708,9 @@ pub(crate) fn check(
     if let Some(&(id, next)) = c.leaves.last()
         && next != 0
     {
-        return Err(Error::corrupt(format!("tree check: last leaf {id} links to {next}")));
+        return Err(Error::corrupt(format!(
+            "tree check: last leaf {id} links to {next}"
+        )));
     }
     c.stats.height = c.leaf_depth.unwrap_or(0) + 1;
     Ok(c.stats)
@@ -601,7 +731,10 @@ mod tests {
     }
     impl MemStore {
         fn new() -> (Self, PageId) {
-            let mut s = MemStore { next: 1, ..Default::default() };
+            let mut s = MemStore {
+                next: 1,
+                ..Default::default()
+            };
             let r = s.alloc_page().unwrap();
             s.write_node(r, &Node::empty_leaf()).unwrap();
             (s, r)
@@ -609,10 +742,17 @@ mod tests {
     }
     impl NodeStore for MemStore {
         fn read_node(&mut self, id: PageId) -> Result<Node> {
-            Node::decode(self.pages.get(&id).ok_or_else(|| Error::corrupt("missing"))?)
+            Node::decode(
+                self.pages
+                    .get(&id)
+                    .ok_or_else(|| Error::corrupt("missing"))?,
+            )
         }
         fn write_node(&mut self, id: PageId, n: &Node) -> Result<()> {
-            let p = self.pages.get_mut(&id).ok_or_else(|| Error::corrupt("missing"))?;
+            let p = self
+                .pages
+                .get_mut(&id)
+                .ok_or_else(|| Error::corrupt("missing"))?;
             n.encode_into(p)
         }
         fn alloc_page(&mut self) -> Result<PageId> {
@@ -645,7 +785,9 @@ mod tests {
         let (_, mut node) = seek_leaf(s, root, &[]).unwrap();
         let mut got = Vec::new();
         loop {
-            let Node::Leaf { next, entries } = node else { panic!() };
+            let Node::Leaf { next, entries } = node else {
+                panic!()
+            };
             got.extend(entries);
             if next == 0 {
                 break;
@@ -670,10 +812,16 @@ mod tests {
     fn encode_decode_roundtrip() {
         let mut p = new_page_buf();
         init_page(&mut p, 5, PageType::Leaf);
-        let n = Node::Leaf { next: 9, entries: vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), vec![])] };
+        let n = Node::Leaf {
+            next: 9,
+            entries: vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), vec![])],
+        };
         n.encode_into(&mut p).unwrap();
         assert_eq!(Node::decode(&p).unwrap(), n);
-        let i = Node::Internal { keys: vec![b"m".to_vec()], children: vec![2, 3] };
+        let i = Node::Internal {
+            keys: vec![b"m".to_vec()],
+            children: vec![2, 3],
+        };
         i.encode_into(&mut p).unwrap();
         assert_eq!(Node::decode(&p).unwrap(), i);
     }
@@ -682,13 +830,26 @@ mod tests {
     fn decode_rejects_unsorted_and_bad_pointers() {
         let mut p = new_page_buf();
         init_page(&mut p, 5, PageType::Leaf);
-        Node::Leaf { next: 0, entries: vec![(b"b".to_vec(), vec![]), (b"a".to_vec(), vec![])] }
-            .encode_into(&mut p)
-            .unwrap();
+        Node::Leaf {
+            next: 0,
+            entries: vec![(b"b".to_vec(), vec![]), (b"a".to_vec(), vec![])],
+        }
+        .encode_into(&mut p)
+        .unwrap();
         assert!(Node::decode(&p).is_err());
-        Node::Internal { keys: vec![b"m".to_vec()], children: vec![5, 3] }.encode_into(&mut p).unwrap();
+        Node::Internal {
+            keys: vec![b"m".to_vec()],
+            children: vec![5, 3],
+        }
+        .encode_into(&mut p)
+        .unwrap();
         assert!(Node::decode(&p).is_err(), "self-pointer");
-        Node::Internal { keys: vec![b"m".to_vec()], children: vec![0, 3] }.encode_into(&mut p).unwrap();
+        Node::Internal {
+            keys: vec![b"m".to_vec()],
+            children: vec![0, 3],
+        }
+        .encode_into(&mut p)
+        .unwrap();
         assert!(Node::decode(&p).is_err(), "null child");
         // count larger than the body
         init_page(&mut p, 5, PageType::Leaf);
@@ -738,7 +899,14 @@ mod tests {
             let mut k = vec![0u8; MAX_KEY_LEN];
             k[..4].copy_from_slice(&(rng.next() as u32).to_be_bytes());
             k[MAX_KEY_LEN - 4..].copy_from_slice(&i.to_be_bytes());
-            let v = vec![i as u8; if i % 3 == 0 { MAX_VALUE_LEN } else { (i * 7 % 900) as usize }];
+            let v = vec![
+                i as u8;
+                if i % 3 == 0 {
+                    MAX_VALUE_LEN
+                } else {
+                    (i * 7 % 900) as usize
+                }
+            ];
             insert(&mut s, root, &k, &v).unwrap();
             model.insert(k, v);
         }
@@ -751,8 +919,14 @@ mod tests {
             }
         }
         check_all(&mut s, root, &model);
-        assert!(matches!(insert(&mut s, root, &vec![0; MAX_KEY_LEN + 1], b""), Err(Error::KeyTooLarge(_))));
-        assert!(matches!(insert(&mut s, root, b"k", &vec![0; MAX_VALUE_LEN + 1]), Err(Error::ValueTooLarge(_))));
+        assert!(matches!(
+            insert(&mut s, root, &vec![0; MAX_KEY_LEN + 1], b""),
+            Err(Error::KeyTooLarge(_))
+        ));
+        assert!(matches!(
+            insert(&mut s, root, b"k", &vec![0; MAX_VALUE_LEN + 1]),
+            Err(Error::ValueTooLarge(_))
+        ));
     }
 
     #[test]
@@ -776,9 +950,30 @@ mod tests {
         // Build an internal node pointing at another internal node that points back.
         let a = s.alloc_page().unwrap();
         let b = s.alloc_page().unwrap();
-        s.write_node(a, &Node::Internal { keys: vec![b"m".to_vec()], children: vec![b, b] }).unwrap();
-        s.write_node(b, &Node::Internal { keys: vec![b"m".to_vec()], children: vec![a, a] }).unwrap();
-        s.write_node(root, &Node::Internal { keys: vec![b"m".to_vec()], children: vec![a, a] }).unwrap();
+        s.write_node(
+            a,
+            &Node::Internal {
+                keys: vec![b"m".to_vec()],
+                children: vec![b, b],
+            },
+        )
+        .unwrap();
+        s.write_node(
+            b,
+            &Node::Internal {
+                keys: vec![b"m".to_vec()],
+                children: vec![a, a],
+            },
+        )
+        .unwrap();
+        s.write_node(
+            root,
+            &Node::Internal {
+                keys: vec![b"m".to_vec()],
+                children: vec![a, a],
+            },
+        )
+        .unwrap();
         assert!(get(&mut s, root, b"x").is_err());
         assert!(insert(&mut s, root, b"x", b"y").is_err());
         assert!(delete(&mut s, root, b"x").is_err());

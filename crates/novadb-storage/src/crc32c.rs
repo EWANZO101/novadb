@@ -51,8 +51,8 @@ impl Crc32c {
     pub fn update(&mut self, data: &[u8]) {
         let t = &TABLES;
         let mut crc = self.0;
-        let mut chunks = data.chunks_exact(8);
-        for c in &mut chunks {
+        let (chunks, rem) = data.as_chunks::<8>();
+        for c in chunks {
             let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ crc;
             let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
             crc = t[7][(lo & 0xFF) as usize]
@@ -64,7 +64,7 @@ impl Crc32c {
                 ^ t[1][((hi >> 16) & 0xFF) as usize]
                 ^ t[0][(hi >> 24) as usize];
         }
-        for &b in chunks.remainder() {
+        for &b in rem {
             crc = (crc >> 8) ^ t[0][((crc ^ b as u32) & 0xFF) as usize];
         }
         self.0 = crc;
@@ -92,7 +92,11 @@ mod tests {
         for &b in data {
             crc ^= b as u32;
             for _ in 0..8 {
-                crc = if crc & 1 != 0 { (crc >> 1) ^ POLY } else { crc >> 1 };
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ POLY
+                } else {
+                    crc >> 1
+                };
             }
         }
         !crc
@@ -108,7 +112,9 @@ mod tests {
 
     #[test]
     fn matches_bitwise_and_incremental() {
-        let data: Vec<u8> = (0..1000u32).map(|i| (i.wrapping_mul(31) ^ (i >> 3)) as u8).collect();
+        let data: Vec<u8> = (0..1000u32)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 3)) as u8)
+            .collect();
         for len in [0, 1, 7, 8, 9, 15, 16, 17, 63, 64, 999, 1000] {
             assert_eq!(crc32c(&data[..len]), bitwise(&data[..len]), "len {len}");
         }

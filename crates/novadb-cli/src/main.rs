@@ -17,11 +17,15 @@ const USAGE: &str = "usage:
   novadb DIR stats";
 
 fn run(args: &[String]) -> Result<(), String> {
-    let [dir, cmd, rest @ ..] = args else { return Err(USAGE.into()) };
+    let [dir, cmd, rest @ ..] = args else {
+        return Err(USAGE.into());
+    };
     let mut db = Db::open(dir, Options::default()).map_err(|e| e.to_string())?;
     let e = |e: novadb_storage::Error| e.to_string();
     let mut out = std::io::stdout().lock();
-    let w = |out: &mut std::io::StdoutLock<'_>, s: String| writeln!(out, "{s}").map_err(|e| e.to_string());
+    let w = |out: &mut std::io::StdoutLock<'_>, s: String| {
+        writeln!(out, "{s}").map_err(|e| e.to_string())
+    };
     match (cmd.as_str(), rest) {
         ("put", [t, k, v]) => {
             db.update(|tx| {
@@ -51,7 +55,10 @@ fn run(args: &[String]) -> Result<(), String> {
             let rows = db
                 .view(|tx| {
                     let t = tx.open_tree(t)?;
-                    let start = bounds.first().map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+                    let start = bounds
+                        .first()
+                        .map(|s| s.as_bytes().to_vec())
+                        .unwrap_or_default();
                     let end = match bounds.get(1) {
                         Some(e) => Bound::Excluded(e.as_bytes()),
                         None => Bound::Unbounded,
@@ -61,7 +68,14 @@ fn run(args: &[String]) -> Result<(), String> {
                 })
                 .map_err(e)?;
             for (k, v) in rows {
-                w(&mut out, format!("{}\t{}", String::from_utf8_lossy(&k), String::from_utf8_lossy(&v)))?;
+                w(
+                    &mut out,
+                    format!(
+                        "{}\t{}",
+                        String::from_utf8_lossy(&k),
+                        String::from_utf8_lossy(&v)
+                    ),
+                )?;
             }
         }
         ("trees", []) => {
