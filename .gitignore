@@ -2,3 +2,6 @@ target/
 *.db
 *.wal
 .env
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
