@@ -9,7 +9,7 @@ use std::ops::Bound;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn opts() -> Options {
-    Options { cache_pages: 20, checkpoint_wal_bytes: 64 * 1024, create_if_missing: true }
+    Options { cache_pages: 32, checkpoint_wal_bytes: 64 * 1024, create_if_missing: true }
 }
 
 fn dump(db: &mut Db) -> Model {

@@ -31,6 +31,11 @@ const CATALOG_TREE_ID: u64 = 1;
 pub const MAX_TREE_NAME: usize = 255;
 /// Frames kept unpinned so lookups can always proceed during a large transaction.
 const POOL_RESERVE: usize = 8;
+/// Smallest accepted buffer pool.
+pub const MIN_CACHE_PAGES: usize = 32;
+/// Catalog key prefix of dropped trees awaiting page reclamation (user names can't contain
+/// control characters, so this never collides).
+const DROPPED_PREFIX: &[u8] = b"\0dropped\0";
 
 /// Tuning options.
 #[derive(Debug, Clone)]
@@ -120,10 +125,12 @@ impl Meta {
 pub struct Tree {
     id: u64,
     root: PageId,
+    /// Random id of the `Db` instance that produced this handle.
+    instance: u64,
 }
 
 impl Tree {
-    /// Internal tree id (stable, never reused).
+    /// Internal tree id (never reused while the `Db` handle is open).
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -146,6 +153,8 @@ pub struct Stats {
     pub page_writes: u64,
     /// Checkpoints taken by this handle.
     pub checkpoints: u64,
+    /// Last error while reclaiming dropped trees, if any.
+    pub purge_error: Option<String>,
 }
 
 /// Result of [`Db::verify`].
@@ -159,6 +168,8 @@ pub struct VerifyReport {
     pub used_pages: u64,
     /// Free pages.
     pub free_pages: u64,
+    /// Dropped trees whose pages are not reclaimed yet.
+    pub dropped_pending: u64,
 }
 
 /// An open database. Single writer: all access goes through `&mut self`.
@@ -176,6 +187,12 @@ pub struct Db {
     opts: Options,
     recovery: RecoveryReport,
     checkpoints: u64,
+    /// Random per-open id stamped into `Tree` handles.
+    instance: u64,
+    /// Tree ids handed out so far; survives rollbacks so ids are never reused in this handle.
+    tree_id_floor: u64,
+    /// Last error from reclaiming dropped trees (non-fatal; retried on next open/drop).
+    purge_error: Option<String>,
 }
 
 fn new_salt(avoid: u32) -> u32 {
@@ -252,10 +269,10 @@ impl Db {
 
     /// Open using a custom [`Vfs`] (e.g. [`crate::SimVfs`] for crash testing).
     pub fn open_vfs(vfs: Box<dyn Vfs>, opts: Options) -> Result<Db> {
-        if !(POOL_RESERVE * 2..=1 << 22).contains(&opts.cache_pages) {
+        if !(MIN_CACHE_PAGES..=1 << 22).contains(&opts.cache_pages) {
             return Err(Error::InvalidArgument(format!(
                 "cache_pages must be in {}..={}",
-                POOL_RESERVE * 2,
+                MIN_CACHE_PAGES,
                 1 << 22
             )));
         }
@@ -287,7 +304,10 @@ impl Db {
                 // Crash during creation leaves a WAL without commits; anything else means the
                 // data file was lost and we must not silently start over.
                 let mut w = vfs.open(WAL_FILE, false)?;
-                if wal_has_commits(&mut *w)? || !opts.create_if_missing {
+                let (_, h0) = WalScanner::open(&mut *w)?;
+                // start_lsn 1 + no commits = a WAL from creation that never logged anything.
+                // A checkpointed WAL also has no commits, so it must not count as "new".
+                if h0.start_lsn != 1 || wal_has_commits(&mut *w)? || !opts.create_if_missing {
                     return Err(Error::corrupt(
                         "data file missing but WAL has committed records",
                     ));
@@ -349,7 +369,32 @@ impl Db {
             opts,
             recovery: report,
             checkpoints: 0,
+            instance: new_db_id(),
+            tree_id_floor: meta.next_tree_id,
+            purge_error: None,
         })
+        .map(|mut db| {
+            db.purge_dropped();
+            db
+        })
+    }
+
+    /// Reclaim pages of dropped trees in bounded transactions. Non-fatal errors are kept in
+    /// [`Stats::purge_error`] and retried later; fatal ones poison the handle as usual.
+    fn purge_dropped(&mut self) {
+        loop {
+            match self.update(|tx| tx.purge_step()) {
+                Ok(true) => continue,
+                Ok(false) => {
+                    self.purge_error = None;
+                    return;
+                }
+                Err(e) => {
+                    self.purge_error = Some(e.to_string());
+                    return;
+                }
+            }
+        }
     }
 
     /// What crash recovery did when this handle was opened.
@@ -367,6 +412,7 @@ impl Db {
             page_reads: self.pool.reads,
             page_writes: self.pool.writes,
             checkpoints: self.checkpoints,
+            purge_error: self.purge_error.clone(),
         }
     }
 
@@ -393,6 +439,7 @@ impl Db {
             meta_before: meta,
             failed: false,
             done: false,
+            dropped: false,
         })
     }
 
@@ -445,7 +492,7 @@ impl Db {
     /// Full integrity check of every tree, the catalog and the free list.
     pub fn verify(&mut self) -> Result<VerifyReport> {
         let mut tx = self.begin()?;
-        tx.verify()
+        tx.run(|tx| tx.verify())
     }
 }
 
@@ -457,6 +504,8 @@ pub struct Tx<'a> {
     meta_before: Meta,
     failed: bool,
     done: bool,
+    /// A tree was dropped: reclaim its pages after commit.
+    dropped: bool,
 }
 
 impl Drop for Tx<'_> {
@@ -668,12 +717,114 @@ impl<'a> Tx<'a> {
     // ----- catalog ------------------------------------------------------------------------
 
     fn check_name(name: &str) -> Result<()> {
-        if name.is_empty() || name.len() > MAX_TREE_NAME {
+        if name.is_empty() || name.len() > MAX_TREE_NAME || name.chars().any(char::is_control) {
             return Err(Error::InvalidArgument(format!(
-                "tree name must be 1..={MAX_TREE_NAME} bytes"
+                "tree name must be 1..={MAX_TREE_NAME} bytes without control characters"
             )));
         }
         Ok(())
+    }
+
+    fn check_handle(&self, t: &Tree) -> Result<()> {
+        if t.instance != self.db.instance {
+            return Err(Error::InvalidArgument(
+                "tree handle belongs to a different database handle".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn catalog_tree(&self) -> Tree {
+        Tree {
+            id: CATALOG_TREE_ID,
+            root: CATALOG_ROOT,
+            instance: self.db.instance,
+        }
+    }
+
+    fn parse_catalog_value(&self, key: &[u8], v: &[u8]) -> Result<Tree> {
+        if v.len() != 16 {
+            return Err(Error::corrupt(format!("catalog entry {key:?}: bad length")));
+        }
+        let t = Tree {
+            id: get_u64(v, 0),
+            root: get_u64(v, 8),
+            instance: self.db.instance,
+        };
+        if t.id <= CATALOG_TREE_ID
+            || t.id >= self.db.meta.next_tree_id
+            || t.root <= CATALOG_ROOT
+            || t.root >= self.db.meta.page_count
+        {
+            return Err(Error::corrupt(format!("catalog entry {key:?}: bad values")));
+        }
+        Ok(t)
+    }
+
+    /// All catalog entries (including dropped trees awaiting reclamation).
+    fn catalog_entries(&mut self) -> Result<Vec<(Vec<u8>, Tree)>> {
+        let cat = self.catalog_tree();
+        let raw: Vec<(Vec<u8>, Vec<u8>)> = self
+            .range_inner(cat, (Bound::Unbounded, Bound::Unbounded))?
+            .collect::<Result<_>>()?;
+        raw.into_iter()
+            .map(|(k, v)| {
+                let t = self.parse_catalog_value(&k, &v)?;
+                Ok((k, t))
+            })
+            .collect()
+    }
+
+    /// One bounded step of reclaiming a dropped tree. Returns whether work remains.
+    fn purge_step(&mut self) -> Result<bool> {
+        self.run(|tx| {
+            let cat = tx.catalog_tree();
+            let first = tx
+                .range_inner(
+                    cat,
+                    (Bound::Included(DROPPED_PREFIX.to_vec()), Bound::Unbounded),
+                )?
+                .next()
+                .transpose()?;
+            let Some((key, val)) = first else {
+                return Ok(false);
+            };
+            if !key.starts_with(DROPPED_PREFIX) {
+                return Ok(false);
+            }
+            let t = tx.parse_catalog_value(&key, &val)?;
+            if let Node::Leaf { .. } = tx.ctx(t.id).read_node(t.root)? {
+                tx.free(t.root, t.id)?;
+                btree::delete(&mut tx.ctx(CATALOG_TREE_ID), CATALOG_ROOT, &key)?;
+                return Ok(true);
+            }
+            // Shrink the tree by deleting keys (keeps it a valid tree at every commit, so
+            // `verify` and crash recovery never see a half-freed structure).
+            let budget = tx.pin_limit() / 2;
+            let keys: Vec<Vec<u8>> = tx
+                .range_inner(t, (Bound::Unbounded, Bound::Unbounded))?
+                .take(512)
+                .map(|r| r.map(|(k, _)| k))
+                .collect::<Result<_>>()?;
+            let mut deleted = 0;
+            for k in keys {
+                if deleted > 0 && tx.before.len() >= budget {
+                    break;
+                }
+                btree::delete(&mut tx.ctx(t.id), t.root, &k)?;
+                deleted += 1;
+            }
+            if deleted == 0 {
+                // Internal root but no entries (only possible after corruption): free directly.
+                let mut pages = Vec::new();
+                btree::collect_pages(&mut tx.ctx(t.id), t.root, &mut pages)?;
+                for p in pages {
+                    tx.free(p, t.id)?;
+                }
+                btree::delete(&mut tx.ctx(CATALOG_TREE_ID), CATALOG_ROOT, &key)?;
+            }
+            Ok(true)
+        })
     }
 
     fn catalog_get(&mut self, name: &str) -> Result<Option<Tree>> {
@@ -682,22 +833,8 @@ impl<'a> Tx<'a> {
             CATALOG_ROOT,
             name.as_bytes(),
         )?;
-        let Some(v) = v else { return Ok(None) };
-        if v.len() != 16 {
-            return Err(Error::corrupt(format!(
-                "catalog entry {name:?}: bad length"
-            )));
-        }
-        let t = Tree {
-            id: get_u64(&v, 0),
-            root: get_u64(&v, 8),
-        };
-        if t.id <= CATALOG_TREE_ID || t.root <= CATALOG_ROOT || t.root >= self.db.meta.page_count {
-            return Err(Error::corrupt(format!(
-                "catalog entry {name:?}: bad values"
-            )));
-        }
-        Ok(Some(t))
+        v.map(|v| self.parse_catalog_value(name.as_bytes(), &v))
+            .transpose()
     }
 
     /// Create a new, empty tree.
@@ -707,8 +844,12 @@ impl<'a> Tx<'a> {
             return Err(Error::TreeExists(name.to_string()));
         }
         self.run(|tx| {
-            let id = tx.db.meta.next_tree_id;
-            tx.db.meta.next_tree_id += 1;
+            let id = tx.db.meta.next_tree_id.max(tx.db.tree_id_floor);
+            if id >= (1 << 62) - 1 {
+                return Err(Error::InvalidArgument("tree ids exhausted".into()));
+            }
+            tx.db.meta.next_tree_id = id + 1;
+            tx.db.tree_id_floor = id + 1;
             let root = tx.alloc(id)?;
             let mut c = tx.ctx(id);
             c.write_node(root, &Node::empty_leaf())?;
@@ -721,7 +862,11 @@ impl<'a> Tx<'a> {
                 name.as_bytes(),
                 &v,
             )?;
-            Ok(Tree { id, root })
+            Ok(Tree {
+                id,
+                root,
+                instance: tx.db.instance,
+            })
         })
     }
 
@@ -744,29 +889,25 @@ impl<'a> Tx<'a> {
     pub fn drop_tree(&mut self, name: &str) -> Result<()> {
         let t = self.open_tree(name)?;
         self.run(|tx| {
-            let mut pages = Vec::new();
-            btree::collect_pages(&mut tx.ctx(t.id), t.root, &mut pages)?;
-            for p in pages {
-                tx.free(p, t.id)?;
-            }
+            // Atomically move the tree out of the namespace; its pages are reclaimed after
+            // commit in bounded transactions (so trees larger than the cache can be dropped).
+            let mut key = DROPPED_PREFIX.to_vec();
+            key.extend_from_slice(&t.id.to_be_bytes());
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&t.id.to_le_bytes());
+            v.extend_from_slice(&t.root.to_le_bytes());
             btree::delete(&mut tx.ctx(CATALOG_TREE_ID), CATALOG_ROOT, name.as_bytes())?;
+            btree::insert(&mut tx.ctx(CATALOG_TREE_ID), CATALOG_ROOT, &key, &v)?;
+            tx.dropped = true;
             Ok(())
         })
     }
 
     /// Names of all trees, sorted.
     pub fn list_trees(&mut self) -> Result<Vec<String>> {
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-            .range_inner(
-                Tree {
-                    id: CATALOG_TREE_ID,
-                    root: CATALOG_ROOT,
-                },
-                (Bound::Unbounded, Bound::Unbounded),
-            )?
-            .collect::<Result<_>>()?;
-        entries
+        self.catalog_entries()?
             .into_iter()
+            .filter(|(k, _)| !k.starts_with(DROPPED_PREFIX))
             .map(|(k, _)| {
                 String::from_utf8(k).map_err(|_| Error::corrupt("catalog: non-UTF-8 name"))
             })
@@ -778,6 +919,7 @@ impl<'a> Tx<'a> {
     /// Point lookup.
     pub fn get(&mut self, t: &Tree, key: &[u8]) -> Result<Option<Vec<u8>>> {
         btree::check_kv(key, None)?;
+        self.check_handle(t)?;
         let t = *t;
         self.run(|tx| btree::get(&mut tx.ctx(t.id), t.root, key))
     }
@@ -785,6 +927,7 @@ impl<'a> Tx<'a> {
     /// Insert or overwrite; returns the previous value.
     pub fn put(&mut self, t: &Tree, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
         btree::check_kv(key, Some(value))?;
+        self.check_handle(t)?;
         let t = *t;
         self.run(|tx| btree::insert(&mut tx.ctx(t.id), t.root, key, value))
     }
@@ -792,6 +935,7 @@ impl<'a> Tx<'a> {
     /// Delete; returns the removed value.
     pub fn delete(&mut self, t: &Tree, key: &[u8]) -> Result<Option<Vec<u8>>> {
         btree::check_kv(key, None)?;
+        self.check_handle(t)?;
         let t = *t;
         self.run(|tx| btree::delete(&mut tx.ctx(t.id), t.root, key))
     }
@@ -802,6 +946,7 @@ impl<'a> Tx<'a> {
         t: &Tree,
         range: impl RangeBounds<[u8]>,
     ) -> Result<RangeIter<'t, 'a>> {
+        self.check_handle(t)?;
         let b = (
             bound_owned(range.start_bound()),
             bound_owned(range.end_bound()),
@@ -874,6 +1019,9 @@ impl<'a> Tx<'a> {
             // The WAL may or may not contain the commit; memory state can't be trusted.
             // Reopening the database recovers to a consistent state.
             self.db.poison(e);
+        }
+        if r.is_ok() && self.dropped {
+            self.db.purge_dropped();
         }
         r
     }
@@ -973,17 +1121,22 @@ impl<'a> Tx<'a> {
         };
         mark(0)?;
         let mut rep = VerifyReport::default();
-        let names = self.list_trees()?;
+        let entries = self.catalog_entries()?;
         btree::check(&mut self.ctx(CATALOG_TREE_ID), CATALOG_ROOT, &mut mark)?;
         let mut ids = HashSet::new();
-        for name in names {
-            let t = self.open_tree(&name)?;
-            if !ids.insert(t.id) || t.id >= self.db.meta.next_tree_id {
-                return Err(Error::corrupt(format!("verify: bad tree id for {name:?}")));
+        for (name, t) in entries {
+            if !ids.insert(t.id) {
+                return Err(Error::corrupt(format!(
+                    "verify: duplicate tree id for {name:?}"
+                )));
             }
             let st = btree::check(&mut self.ctx(t.id), t.root, &mut mark)?;
-            rep.trees += 1;
-            rep.entries += st.entries;
+            if name.starts_with(DROPPED_PREFIX) {
+                rep.dropped_pending += 1;
+            } else {
+                rep.trees += 1;
+                rep.entries += st.entries;
+            }
         }
         let mut cur = self.db.meta.freelist_head;
         while cur != 0 {

@@ -29,6 +29,7 @@ pub fn recover(wal: &mut dyn VfsFile, pager: &mut Pager) -> Result<RecoveryRepor
     // Pass 1: find the end of the last committed transaction.
     let (mut commit_end, mut next_lsn, mut commits, mut total, mut committed_records, torn);
     let mut image_db_id = None;
+    let mut pending_image_db_id = None;
     let wal_db_id;
     {
         let (mut sc, hdr) = WalScanner::open(wal)?;
@@ -44,9 +45,13 @@ pub fn recover(wal: &mut dyn VfsFile, pager: &mut Pager) -> Result<RecoveryRepor
                 && r.payload.len() == 8 + PAGE_SIZE
                 && get_u64(r.payload, 0) == 0
             {
-                image_db_id = Some(get_u64(r.payload, 8 + page::META_DB_ID_OFFSET));
+                pending_image_db_id = Some(get_u64(r.payload, 8 + page::META_DB_ID_OFFSET));
             }
             if r.kind == RecordKind::Commit {
+                // Only meta images of committed transactions count for the db-id check.
+                if pending_image_db_id.is_some() {
+                    image_db_id = pending_image_db_id;
+                }
                 if !r.payload.is_empty() {
                     return Err(Error::corrupt(format!(
                         "WAL record {}: commit with payload",

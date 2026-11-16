@@ -396,7 +396,7 @@ fn corrupted_page_is_reported_not_panicking() {
 #[test]
 fn torn_data_pages_are_repaired_from_wal() {
     let v = SimVfs::new();
-    let mut db = Db::open_vfs(Box::new(v.clone()), opts(24)).unwrap();
+    let mut db = Db::open_vfs(Box::new(v.clone()), opts(32)).unwrap();
     let mut model = BTreeMap::new();
     for c in 0..40u64 {
         db.update(|tx| {
@@ -417,7 +417,7 @@ fn torn_data_pages_are_repaired_from_wal() {
         chunk[1000..1512].fill(i as u8); // torn sector
     }
     v.put_file(DATA_FILE, &data);
-    let mut db = Db::open_vfs(Box::new(v.clone()), opts(24)).unwrap();
+    let mut db = Db::open_vfs(Box::new(v.clone()), opts(32)).unwrap();
     assert!(db.recovery_report().pages_applied > 0);
     db.verify().unwrap();
     assert_eq!(dump(&mut db, "t"), model);
@@ -567,4 +567,118 @@ fn fsync_failure_poisons_the_handle() {
     assert_eq!(m[b"a".as_slice()], b"1");
     assert!(m.len() <= 2);
     db.verify().unwrap();
+}
+
+// ----- regression tests for review findings (2026-11-16) -----------------------------------
+
+fn fill(db: &mut Db, name: &str, n: u64, vlen: usize) {
+    for c in 0..n.div_ceil(200) {
+        db.update(|tx| {
+            let t = tx.open_or_create_tree(name)?;
+            for i in c * 200..((c + 1) * 200).min(n) {
+                tx.put(&t, &key(i), &vec![i as u8; vlen])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn dropping_a_tree_larger_than_the_cache_works() {
+    let v = SimVfs::new();
+    let mut db = open(&v, 32);
+    fill(&mut db, "big", 6000, 300); // ~130 pages, cache is 32
+    fill(&mut db, "keep", 100, 10);
+    let pages = db.stats().page_count;
+    db.update(|tx| tx.drop_tree("big")).unwrap();
+    assert_eq!(db.stats().purge_error, None);
+    let r = db.verify().unwrap();
+    assert_eq!(r.dropped_pending, 0);
+    assert_eq!(r.trees, 1);
+    assert!(r.free_pages > 100, "{r:?}");
+    assert_eq!(
+        db.view(|tx| tx.list_trees()).unwrap(),
+        vec!["keep".to_string()]
+    );
+    // the name is immediately reusable, and freed pages are reused
+    fill(&mut db, "big", 6000, 300);
+    assert!(db.stats().page_count <= pages + 2);
+    db.verify().unwrap();
+}
+
+#[test]
+fn drop_is_atomic_and_reclamation_resumes_after_crash() {
+    for seed in 0..20u64 {
+        let v = SimVfs::new();
+        let mut db = open(&v, 32);
+        fill(&mut db, "big", 3000, 300);
+        fill(&mut db, "keep", 50, 10);
+        // Power fails somewhere during the drop or the page reclamation that follows it.
+        let mut rng = SimRng::new(seed);
+        v.fail_after(Some(v.op_count() + 1 + rng.below(60)));
+        let dropped = db.update(|tx| tx.drop_tree("big")).is_ok();
+        drop(db);
+        v.crash(&mut rng);
+        let mut db = open(&v, 32);
+        let r = db.verify().unwrap();
+        assert_eq!(
+            r.dropped_pending, 0,
+            "seed {seed}: reclamation must finish on open"
+        );
+        let trees = db.view(|tx| tx.list_trees()).unwrap();
+        assert!(trees.contains(&"keep".to_string()));
+        if dropped {
+            // commit was acknowledged before the fault hit the reclamation phase
+            assert!(!trees.contains(&"big".to_string()), "seed {seed}");
+        }
+        if trees.contains(&"big".to_string()) {
+            assert_eq!(
+                dump(&mut db, "big").len(),
+                3000,
+                "seed {seed}: drop must be atomic"
+            );
+        }
+    }
+}
+
+#[test]
+fn lost_data_file_after_checkpoint_is_not_silently_recreated() {
+    let v = SimVfs::new();
+    {
+        let mut db = open(&v, 64);
+        fill(&mut db, "t", 10, 10);
+        db.close().unwrap(); // WAL now has no commits but start_lsn > 1
+    }
+    let only_wal = SimVfs::new();
+    only_wal.put_file(WAL_FILE, &v.get_file(WAL_FILE).unwrap());
+    assert!(matches!(
+        Db::open_vfs(Box::new(only_wal), opts(64)),
+        Err(Error::Corruption(_))
+    ));
+}
+
+#[test]
+fn handles_are_bound_to_their_db_instance_and_ids_not_reused() {
+    let v = SimVfs::new();
+    let mut db = open(&v, 64);
+    let t = db.update(|tx| tx.create_tree("t")).unwrap();
+    drop(db);
+    let mut db = open(&v, 64);
+    let r = db.update(|tx| tx.put(&t, b"k", b"v"));
+    assert!(matches!(r, Err(Error::InvalidArgument(_))), "{r:?}");
+    // tree id from a rolled-back create is not handed out again
+    let ghost = {
+        let mut tx = db.begin().unwrap();
+        let g = tx.create_tree("ghost").unwrap();
+        tx.rollback();
+        g
+    };
+    let real = db.update(|tx| tx.create_tree("real")).unwrap();
+    assert_ne!(ghost.id(), real.id());
+    assert!(db.update(|tx| tx.put(&ghost, b"k", b"v")).is_err());
+    assert!(
+        db.view(|tx| tx.open_tree("a\u{0}b")).is_err(),
+        "control chars rejected"
+    );
 }

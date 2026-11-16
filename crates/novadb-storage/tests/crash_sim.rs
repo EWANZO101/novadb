@@ -11,7 +11,7 @@ type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn opts() -> Options {
     Options {
-        cache_pages: 24,
+        cache_pages: 32,
         checkpoint_wal_bytes: 64 * 1024,
         create_if_missing: true,
     }
@@ -29,6 +29,20 @@ fn read_all(db: &mut Db) -> Result<Model, Error> {
 fn txn(db: &mut Db, rng: &mut SimRng, model: &Model) -> Result<Model, Error> {
     let mut m = model.clone();
     let mut tx = db.begin()?;
+    // Side tree churn (not part of the model): exercises drop + lazy page reclamation under
+    // power loss; `verify` after every reopen checks it left no leaked/shared pages.
+    if rng.chance(1, 8) {
+        match tx.open_tree("aux") {
+            Ok(_) => tx.drop_tree("aux")?,
+            Err(Error::TreeNotFound(_)) => {
+                let a = tx.create_tree("aux")?;
+                for i in 0..150u32 {
+                    tx.put(&a, &i.to_be_bytes(), &[7u8; 90])?;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let t = tx.open_or_create_tree("t")?;
     for _ in 0..rng.below(30) + 1 {
         let k = format!("k{:05}", rng.below(3000)).into_bytes();
@@ -123,6 +137,7 @@ fn run_seed(seed: u64, rounds: usize) {
 
 /// Replays `txn`'s random choices on a model only.
 fn simulate(rng: &mut SimRng, m: &mut Model) {
+    let _aux = rng.chance(1, 8);
     for _ in 0..rng.below(30) + 1 {
         let k = format!("k{:05}", rng.below(3000)).into_bytes();
         match rng.below(10) {

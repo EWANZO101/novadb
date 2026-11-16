@@ -54,7 +54,7 @@ fuzz_target!(|data: &[u8]| {
     let v = SimVfs::new();
     v.put_file(DATA_FILE, &d);
     v.put_file(WAL_FILE, w);
-    let o = Options { cache_pages: 16 + (flags as usize >> 1) % 64, ..Options::default() };
+    let o = Options { cache_pages: 32 + (flags as usize >> 1) % 64, ..Options::default() };
     let Ok(mut db) = Db::open_vfs(Box::new(v), o) else { return };
     let _ = db.verify();
     let _ = db.view(|tx| {

@@ -327,6 +327,52 @@ pub(crate) fn seek_leaf(
 
 type Split = Option<(Vec<u8>, PageId)>;
 
+/// Write internal node `id`, splitting it if it no longer fits. Returns the split (separator +
+/// new right sibling) and the encoded size of what was written to `id`.
+fn write_internal(
+    s: &mut impl NodeStore,
+    id: PageId,
+    mut keys: Vec<Vec<u8>>,
+    mut children: Vec<PageId>,
+) -> Result<(Split, usize)> {
+    if internal_size(&keys) <= BODY_SIZE {
+        let size = internal_size(&keys);
+        s.write_node(id, &Node::Internal { keys, children })?;
+        return Ok((None, size));
+    }
+    let m = split_internal_point(&keys)?;
+    let rkeys = keys.split_off(m + 1);
+    let up = keys
+        .pop()
+        .ok_or_else(|| Error::corrupt("internal error: empty split"))?;
+    let rchildren = children.split_off(m + 1);
+    let nid = s.alloc_page()?;
+    s.write_node(
+        nid,
+        &Node::Internal {
+            keys: rkeys,
+            children: rchildren,
+        },
+    )?;
+    let size = internal_size(&keys);
+    s.write_node(id, &Node::Internal { keys, children })?;
+    Ok((Some((up, nid)), size))
+}
+
+/// The root (which now holds the left half of a split) gets a new level, keeping its page id.
+fn split_root(s: &mut impl NodeStore, root: PageId, sep: Vec<u8>, rid: PageId) -> Result<()> {
+    let left = s.read_node(root)?;
+    let lid = s.alloc_page()?;
+    s.write_node(lid, &left)?;
+    s.write_node(
+        root,
+        &Node::Internal {
+            keys: vec![sep],
+            children: vec![lid, rid],
+        },
+    )
+}
+
 fn insert_rec(
     s: &mut impl NodeStore,
     id: PageId,
@@ -373,26 +419,8 @@ fn insert_rec(
             };
             keys.insert(idx, sep);
             children.insert(idx + 1, rid);
-            if internal_size(&keys) <= BODY_SIZE {
-                s.write_node(id, &Node::Internal { keys, children })?;
-                return Ok((old, None));
-            }
-            let m = split_internal_point(&keys)?;
-            let rkeys = keys.split_off(m + 1);
-            let up = keys
-                .pop()
-                .ok_or_else(|| Error::corrupt("internal error: empty split"))?;
-            let rchildren = children.split_off(m + 1);
-            let nid = s.alloc_page()?;
-            s.write_node(
-                nid,
-                &Node::Internal {
-                    keys: rkeys,
-                    children: rchildren,
-                },
-            )?;
-            s.write_node(id, &Node::Internal { keys, children })?;
-            Ok((old, Some((up, nid))))
+            let (split, _) = write_internal(s, id, keys, children)?;
+            Ok((old, split))
         }
     }
 }
@@ -407,17 +435,7 @@ pub(crate) fn insert(
     check_kv(key, Some(val))?;
     let (old, split) = insert_rec(s, root, key, val, 0)?;
     if let Some((sep, rid)) = split {
-        // The root now holds the left half; move it to a fresh page so the root id is stable.
-        let left = s.read_node(root)?;
-        let lid = s.alloc_page()?;
-        s.write_node(lid, &left)?;
-        s.write_node(
-            root,
-            &Node::Internal {
-                keys: vec![sep],
-                children: vec![lid, rid],
-            },
-        )?;
+        split_root(s, root, sep, rid)?;
     }
     Ok(old)
 }
@@ -538,13 +556,17 @@ fn rebalance(
     Ok(())
 }
 
-/// Returns (removed value, encoded size of node `id` afterwards).
+/// Returns (removed value, encoded size of node `id` afterwards, split of node `id`).
+///
+/// A delete can *grow* an internal node: rebalancing two children replaces their separator,
+/// and the new one may be longer. Such a node is split and the split propagates upwards
+/// exactly like on insert.
 fn delete_rec(
     s: &mut impl NodeStore,
     id: PageId,
     key: &[u8],
     depth: usize,
-) -> Result<Option<(Vec<u8>, usize)>> {
+) -> Result<Option<(Vec<u8>, usize, Split)>> {
     depth_check(depth)?;
     match s.read_node(id)? {
         Node::Leaf { next, mut entries } => {
@@ -554,24 +576,27 @@ fn delete_rec(
             let (_, v) = entries.remove(i);
             let size = leaf_size(&entries);
             s.write_node(id, &Node::Leaf { next, entries })?;
-            Ok(Some((v, size)))
+            Ok(Some((v, size, None)))
         }
         Node::Internal {
             mut keys,
             mut children,
         } => {
             let idx = child_index(&keys, key);
-            let Some((v, child_size)) = delete_rec(s, children[idx], key, depth + 1)? else {
+            let Some((v, child_size, child_split)) = delete_rec(s, children[idx], key, depth + 1)?
+            else {
                 return Ok(None);
             };
-            if child_size < UNDERFLOW && children.len() > 1 {
+            if let Some((sep, rid)) = child_split {
+                keys.insert(idx, sep);
+                children.insert(idx + 1, rid);
+            } else if child_size < UNDERFLOW && children.len() > 1 {
                 rebalance(s, &mut keys, &mut children, idx)?;
-                let size = internal_size(&keys);
-                s.write_node(id, &Node::Internal { keys, children })?;
-                Ok(Some((v, size)))
             } else {
-                Ok(Some((v, internal_size(&keys))))
+                return Ok(Some((v, internal_size(&keys), None)));
             }
+            let (split, size) = write_internal(s, id, keys, children)?;
+            Ok(Some((v, size, split)))
         }
     }
 }
@@ -579,8 +604,13 @@ fn delete_rec(
 /// Delete `key`; returns the removed value.
 pub(crate) fn delete(s: &mut impl NodeStore, root: PageId, key: &[u8]) -> Result<Option<Vec<u8>>> {
     check_kv(key, None)?;
-    let removed = delete_rec(s, root, key, 0)?.map(|(v, _)| v);
-    if removed.is_some() {
+    let Some((removed, _, split)) = delete_rec(s, root, key, 0)? else {
+        return Ok(None);
+    };
+    if let Some((sep, rid)) = split {
+        split_root(s, root, sep, rid)?;
+    }
+    {
         // Collapse a root that has a single child.
         for _ in 0..=MAX_DEPTH {
             match s.read_node(root)? {
@@ -594,7 +624,7 @@ pub(crate) fn delete(s: &mut impl NodeStore, root: PageId, key: &[u8]) -> Result
             }
         }
     }
-    Ok(removed)
+    Ok(Some(removed))
 }
 
 /// Collect every page of the tree rooted at `root` (for drop/verify).
@@ -603,17 +633,30 @@ pub(crate) fn collect_pages(
     root: PageId,
     out: &mut Vec<PageId>,
 ) -> Result<()> {
-    fn rec(s: &mut impl NodeStore, id: PageId, out: &mut Vec<PageId>, depth: usize) -> Result<()> {
+    // `seen` turns DAG-shaped corruption (two parents sharing a child) into an error instead of
+    // an exponential walk.
+    fn rec(
+        s: &mut impl NodeStore,
+        id: PageId,
+        out: &mut Vec<PageId>,
+        seen: &mut std::collections::HashSet<PageId>,
+        depth: usize,
+    ) -> Result<()> {
         depth_check(depth)?;
+        if !seen.insert(id) {
+            return Err(Error::corrupt(format!(
+                "page {id} is referenced twice in one tree"
+            )));
+        }
         out.push(id);
         if let Node::Internal { children, .. } = s.read_node(id)? {
             for c in children {
-                rec(s, c, out, depth + 1)?;
+                rec(s, c, out, seen, depth + 1)?;
             }
         }
         Ok(())
     }
-    rec(s, root, out, 0)
+    rec(s, root, out, &mut std::collections::HashSet::new(), 0)
 }
 
 /// Structural statistics returned by [`check`].
@@ -942,6 +985,128 @@ mod tests {
             }
             check_all(&mut s, root, &model);
         }
+    }
+
+    /// Regression (review finding): rebalancing two leaves replaced a 1-byte separator with a
+    /// 1024-byte one in a nearly full parent, which then no longer fit its page.
+    #[test]
+    fn delete_rebalance_that_grows_parent_splits_it() {
+        let (mut s, root) = MemStore::new();
+        let long = |c: u8, i: u8| {
+            let mut k = vec![c; MAX_KEY_LEN];
+            k[MAX_KEY_LEN - 1] = i;
+            k
+        };
+        let mut model = BTreeMap::new();
+        // child0: one small entry left after the delete -> underflow
+        let c0 = s.alloc_page().unwrap();
+        let mut e0 = vec![
+            (b"a0".to_vec(), vec![1u8; 100]),
+            (b"a1".to_vec(), vec![1u8; 10]),
+        ];
+        // child1: 15 entries with 1024-byte keys, nearly full -> re-split, not merge
+        let c1 = s.alloc_page().unwrap();
+        let e1: Vec<_> = (0..15).map(|i| (long(b'b', i), vec![2u8; 60])).collect();
+        let mut keys = vec![b"b".to_vec()];
+        let mut children = vec![c0, c1];
+        let mut leaves = vec![(c0, e0.clone()), (c1, e1)];
+        for i in 0..15u8 {
+            keys.push(long(b'c', i));
+            let c = s.alloc_page().unwrap();
+            children.push(c);
+            leaves.push((c, vec![(long(b'c', i), b"x".to_vec())]));
+        }
+        assert!(internal_size(&keys) > BODY_SIZE - 1000 && internal_size(&keys) <= BODY_SIZE);
+        for (i, (id, entries)) in leaves.iter().enumerate() {
+            let next = leaves.get(i + 1).map_or(0, |l| l.0);
+            s.write_node(
+                *id,
+                &Node::Leaf {
+                    next,
+                    entries: entries.clone(),
+                },
+            )
+            .unwrap();
+            model.extend(entries.iter().cloned());
+        }
+        s.write_node(root, &Node::Internal { keys, children })
+            .unwrap();
+        check_all(&mut s, root, &model);
+        assert_eq!(delete(&mut s, root, b"a1").unwrap(), Some(vec![1u8; 10]));
+        model.remove(b"a1".as_slice());
+        e0.pop();
+        check_all(&mut s, root, &model);
+        let mut seen = std::collections::HashSet::new();
+        let st = check(&mut s, root, &mut |id| {
+            assert!(seen.insert(id));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(st.height, 3, "root must have split");
+    }
+
+    /// Mixed short/long keys with heavy deletes: exercises separator growth on rebalance.
+    #[test]
+    fn mixed_key_lengths_random_ops() {
+        for seed in 1..=4u64 {
+            let (mut s, root) = MemStore::new();
+            let mut model = BTreeMap::new();
+            let mut rng = Rng(seed * 7919);
+            for step in 0..8000 {
+                let n = rng.next() % 600;
+                let mut k = vec![
+                    b'k';
+                    if rng.next().is_multiple_of(3) {
+                        MAX_KEY_LEN
+                    } else {
+                        1 + (rng.next() % 8) as usize
+                    }
+                ];
+                k[0] = (n / 3) as u8;
+                let l = k.len();
+                k[l - 1] = (n % 251) as u8;
+                if rng.next().is_multiple_of(3) {
+                    assert_eq!(delete(&mut s, root, &k).unwrap(), model.remove(&k));
+                } else {
+                    let v = vec![1u8; (rng.next() % 2000) as usize];
+                    assert_eq!(insert(&mut s, root, &k, &v).unwrap(), model.insert(k, v));
+                }
+                if step % 2000 == 1999 {
+                    check_all(&mut s, root, &model);
+                }
+            }
+            check_all(&mut s, root, &model);
+        }
+    }
+
+    #[test]
+    fn shared_child_is_detected_by_collect_pages() {
+        let (mut s, root) = MemStore::new();
+        let leaf = s.alloc_page().unwrap();
+        s.write_node(leaf, &Node::empty_leaf()).unwrap();
+        let mut prev = leaf;
+        for _ in 0..40 {
+            let n = s.alloc_page().unwrap();
+            s.write_node(
+                n,
+                &Node::Internal {
+                    keys: vec![b"m".to_vec()],
+                    children: vec![prev, prev],
+                },
+            )
+            .unwrap();
+            prev = n;
+        }
+        s.write_node(
+            root,
+            &Node::Internal {
+                keys: vec![b"m".to_vec()],
+                children: vec![prev, prev],
+            },
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        assert!(collect_pages(&mut s, root, &mut out).is_err());
     }
 
     #[test]

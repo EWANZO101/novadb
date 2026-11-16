@@ -20,8 +20,9 @@ pub const PAGE_SIZE: usize = 16 * 1024;
 pub const HEADER_SIZE: usize = 32;
 /// Usable body bytes per page.
 pub const BODY_SIZE: usize = PAGE_SIZE - HEADER_SIZE;
-/// Highest page id we accept (64 TiB data file). Bounds file growth from corrupt/hostile input.
-pub const MAX_PAGE_ID: u64 = (1 << 32) - 1;
+/// Highest page id we accept (4 TiB data file). Bounds file growth and `verify` memory (32 MiB
+/// bitmap) for corrupt/hostile input.
+pub const MAX_PAGE_ID: u64 = (1 << 28) - 1;
 
 /// Page number within the data file. Page 0 is the meta page.
 pub type PageId = u64;
