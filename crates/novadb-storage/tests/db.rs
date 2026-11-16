@@ -592,6 +592,11 @@ fn dropping_a_tree_larger_than_the_cache_works() {
     fill(&mut db, "keep", 100, 10);
     let pages = db.stats().page_count;
     db.update(|tx| tx.drop_tree("big")).unwrap();
+    assert!(
+        db.verify().unwrap().dropped_pending <= 1,
+        "bounded work per commit"
+    );
+    while db.reclaim_dropped(4).unwrap() {}
     assert_eq!(db.stats().purge_error, None);
     let r = db.verify().unwrap();
     assert_eq!(r.dropped_pending, 0);
@@ -621,10 +626,14 @@ fn drop_is_atomic_and_reclamation_resumes_after_crash() {
         drop(db);
         v.crash(&mut rng);
         let mut db = open(&v, 32);
+        db.verify().unwrap();
+        while db.reclaim_dropped(16).unwrap() {
+            db.verify().unwrap();
+        }
         let r = db.verify().unwrap();
         assert_eq!(
             r.dropped_pending, 0,
-            "seed {seed}: reclamation must finish on open"
+            "seed {seed}: reclamation must complete"
         );
         let trees = db.view(|tx| tx.list_trees()).unwrap();
         assert!(trees.contains(&"keep".to_string()));
@@ -681,4 +690,40 @@ fn handles_are_bound_to_their_db_instance_and_ids_not_reused() {
         db.view(|tx| tx.open_tree("a\u{0}b")).is_err(),
         "control chars rejected"
     );
+}
+
+#[test]
+fn reclaiming_a_corrupt_dropped_tree_errors_instead_of_hanging() {
+    use novadb_storage::page::{HEADER_SIZE, PAGE_SIZE, seal};
+    let v = SimVfs::new();
+    {
+        let mut db = open(&v, 64);
+        fill(&mut db, "t", 2500, 8); // first user tree: root is page 2, internal
+        db.close().unwrap();
+    }
+    let mut data = v.get_file(DATA_FILE).unwrap();
+    let root = &mut data[2 * PAGE_SIZE..3 * PAGE_SIZE];
+    assert_eq!(root[4], 3, "root must be an internal page");
+    let klen = u16::from_le_bytes([root[HEADER_SIZE + 10], root[HEADER_SIZE + 11]]) as usize;
+    root[HEADER_SIZE + 12..HEADER_SIZE + 12 + klen].fill(0); // first separator -> all zeros
+    let p: &mut [u8; PAGE_SIZE] = root.try_into().unwrap();
+    seal(p);
+    v.put_file(DATA_FILE, &data);
+    let mut db = open(&v, 64);
+    db.update(|tx| tx.drop_tree("t")).unwrap(); // must return (no infinite loop)
+    let mut err = None;
+    for _ in 0..1000 {
+        match db.reclaim_dropped(8) {
+            Ok(true) => continue,
+            Ok(false) => break,
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(matches!(err, Some(Error::Corruption(_))), "{err:?}");
+    assert!(db.stats().purge_error.is_some());
+    drop(db);
+    let _db = open(&v, 64); // reopen must not hang either
 }

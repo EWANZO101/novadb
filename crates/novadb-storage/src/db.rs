@@ -36,6 +36,9 @@ pub const MIN_CACHE_PAGES: usize = 32;
 /// Catalog key prefix of dropped trees awaiting page reclamation (user names can't contain
 /// control characters, so this never collides).
 const DROPPED_PREFIX: &[u8] = b"\0dropped\0";
+/// Reclamation transactions run per commit/open while dropped trees are pending (bounds the
+/// latency a drop adds to unrelated commits).
+const PURGE_STEPS_PER_CALL: usize = 8;
 
 /// Tuning options.
 #[derive(Debug, Clone)]
@@ -193,6 +196,9 @@ pub struct Db {
     tree_id_floor: u64,
     /// Last error from reclaiming dropped trees (non-fatal; retried on next open/drop).
     purge_error: Option<String>,
+    /// Dropped trees may still hold pages.
+    purge_pending: bool,
+    purging: bool,
 }
 
 fn new_salt(avoid: u32) -> u32 {
@@ -372,6 +378,8 @@ impl Db {
             instance: new_db_id(),
             tree_id_floor: meta.next_tree_id,
             purge_error: None,
+            purge_pending: true,
+            purging: false,
         })
         .map(|mut db| {
             db.purge_dropped();
@@ -379,21 +387,40 @@ impl Db {
         })
     }
 
-    /// Reclaim pages of dropped trees in bounded transactions. Non-fatal errors are kept in
-    /// [`Stats::purge_error`] and retried later; fatal ones poison the handle as usual.
-    fn purge_dropped(&mut self) {
-        loop {
+    /// Reclaim pages of dropped trees, at most `max_steps` bounded transactions. Returns
+    /// whether work remains. Runs automatically (with a small budget) after every commit while
+    /// work is pending and on open; call it explicitly for maintenance.
+    pub fn reclaim_dropped(&mut self, max_steps: usize) -> Result<bool> {
+        self.purging = true;
+        let r = self.reclaim_inner(max_steps);
+        self.purging = false;
+        r
+    }
+
+    fn reclaim_inner(&mut self, max_steps: usize) -> Result<bool> {
+        for _ in 0..max_steps {
             match self.update(|tx| tx.purge_step()) {
                 Ok(true) => continue,
                 Ok(false) => {
+                    self.purge_pending = false;
                     self.purge_error = None;
-                    return;
+                    return Ok(false);
                 }
                 Err(e) => {
+                    // Stop automatic retries until reopen; the error is visible in stats.
+                    self.purge_pending = false;
                     self.purge_error = Some(e.to_string());
-                    return;
+                    return Err(e);
                 }
             }
+        }
+        Ok(true)
+    }
+
+    fn purge_dropped(&mut self) {
+        // `purging`: the reclamation steps commit too; don't recurse from those commits.
+        if self.purge_pending && !self.purging && self.poisoned.is_none() {
+            let _ = self.reclaim_dropped(PURGE_STEPS_PER_CALL);
         }
     }
 
@@ -811,7 +838,14 @@ impl<'a> Tx<'a> {
                 if deleted > 0 && tx.before.len() >= budget {
                     break;
                 }
-                btree::delete(&mut tx.ctx(t.id), t.root, &k)?;
+                // A key returned by the scan but not found by search means the tree is corrupt;
+                // treating it as progress would loop forever (on every open).
+                if btree::delete(&mut tx.ctx(t.id), t.root, &k)?.is_none() {
+                    return Err(Error::corrupt(format!(
+                        "dropped tree {}: scanned key not reachable by search",
+                        t.id
+                    )));
+                }
                 deleted += 1;
             }
             if deleted == 0 {
@@ -1020,7 +1054,11 @@ impl<'a> Tx<'a> {
             // Reopening the database recovers to a consistent state.
             self.db.poison(e);
         }
-        if r.is_ok() && self.dropped {
+        if r.is_ok() {
+            if self.dropped {
+                self.db.purge_pending = true;
+                self.db.purge_error = None;
+            }
             self.db.purge_dropped();
         }
         r
