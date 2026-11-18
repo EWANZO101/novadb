@@ -88,6 +88,57 @@ fn bootstrap(s: &mut Store, dir: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Break-glass recovery (needs shell access to the host/container, never reachable over HTTP):
+/// `novadb-dashboard --reset-admin [user]` gives `user` (default `admin`) a new one-time password,
+/// clears 2FA + recovery codes, unlocks/enables it, makes it an admin and revokes its sessions.
+/// The password goes to `<data>/initial-admin-password.txt` (0600), exactly like first run.
+/// The dashboard must be stopped (the store is single-writer).
+fn reset_admin(name: &str) -> Result<(), String> {
+    let data_dir =
+        PathBuf::from(env("NOVADB_DASH_DATA").unwrap_or_else(|| "dashboard-data".into()));
+    let mut s = Store::open(&data_dir.join("system"))?;
+    let pw = auth::random_password(24)?;
+    let mut u = match s.get_user(name)? {
+        Some(u) => u,
+        None => {
+            let _ = s.close();
+            return Err(format!("no user named '{name}'"));
+        }
+    };
+    u.pw = auth::hash_password(&pw)?;
+    u.must_change = true;
+    u.totp = None;
+    u.totp_last = 0;
+    u.recovery = vec![];
+    u.disabled = false;
+    u.failed = 0;
+    u.locked_until = 0;
+    u.role = Role::Admin;
+    let path = data_dir.join(INITIAL_PW_FILE);
+    let _ = std::fs::remove_file(&path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    writeln!(f, "username: {name}\npassword: {pw}\n\nOne-time password (break-glass reset). You must change it and set up 2FA again at sign-in.\nThis file is deleted automatically once the password is changed.")
+        .map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    s.put_user(&u)?;
+    let n = s.delete_sessions_for(name, None)?;
+    s.audit(
+        web::now(),
+        "system",
+        "-",
+        "reset-admin",
+        &format!("break-glass reset of '{name}': new one-time password, 2FA cleared, {n} session(s) revoked"),
+    )?;
+    s.close()?;
+    println!("[dashboard] reset '{name}'; one-time password is in {}", path.display());
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let data_dir =
         PathBuf::from(env("NOVADB_DASH_DATA").unwrap_or_else(|| "dashboard-data".into()));
@@ -243,7 +294,12 @@ fn main() -> ExitCode {
         println!("novadb-dashboard {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    match run() {
+    let res = if std::env::args().nth(1).as_deref() == Some("--reset-admin") {
+        reset_admin(&std::env::args().nth(2).unwrap_or_else(|| "admin".into()))
+    } else {
+        run()
+    };
+    match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("[dashboard] fatal: {e}");

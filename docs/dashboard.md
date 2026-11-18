@@ -62,3 +62,18 @@ OAuth redirect URIs to register: `<public url>/oauth/discord/callback`, `<public
 * `scripts/dashboard-e2e.py` — 100 black-box checks (incl. browser-style Origin/Sec-Fetch-Site) against a **throwaway** instance (forced setup,
   CSRF/Origin, roles, TOTP replay, session revocation, logout, audit chain, no secrets in log,
   HTTP 429 on brute force).
+
+## Break-glass admin reset
+
+Locked out (forgotten password and/or lost authenticator)? With shell access to the host:
+
+```sh
+docker stop novadb-dashboard
+docker run --rm -v novadb-dash-data:/data -e NOVADB_DASH_DATA=/data --entrypoint /usr/local/bin/novadb-dashboard novadb-dashboard --reset-admin admin
+docker start novadb-dashboard
+docker exec novadb-dashboard cat /data/initial-admin-password.txt
+```
+
+The user gets a new one-time password, 2FA and recovery codes are cleared, the account is unlocked,
+enabled and made admin, and its sessions are revoked. Sign in, set a new password and enrol 2FA again.
+The reset is written to the audit log. There is deliberately no HTTP route for this.
