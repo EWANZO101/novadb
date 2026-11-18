@@ -15,12 +15,13 @@ suites pass. Test results for every stage: [TESTING.md](TESTING.md).
 | 6 | joins, aggregates, subqueries, KILL / `max_execution_time` | ✅ done | [docs/sql.md](docs/sql.md) |
 | 7 | encrypted backups + binlog, point-in-time recovery, metrics, systemd/Docker | ✅ done | [docs/operations.md](docs/operations.md) |
 | — | privileges: `GRANT` / `REVOKE` / `SHOW GRANTS`, least privilege by default | ✅ done | [docs/sql.md](docs/sql.md#privileges) |
+| — | transactional DDL: `CREATE/DROP TABLE/INDEX` roll back with the transaction | ✅ done | [docs/transactions.md](docs/transactions.md#transactional-ddl) |
 | 8 | replication / custom Raft cluster | ⏳ planned | [PLAN.md](PLAN.md) |
 | 9 | control dashboard + identity (started early, live) | 🟡 in progress | [docs/dashboard.md](docs/dashboard.md) |
 | 10 | REST / WebSocket + SDKs | ⏳ planned | [PLAN.md](PLAN.md) |
 
-How NovaDB avoids MySQL's known problems, and what is next (transactional DDL, online
-`ALTER TABLE`, then Stage 8): [docs/mysql-pitfalls.md](docs/mysql-pitfalls.md).
+How NovaDB avoids MySQL's known problems, and what is next (online `ALTER TABLE`,
+then Stage 8): [docs/mysql-pitfalls.md](docs/mysql-pitfalls.md).
 
 ## Layout
 | path | what |

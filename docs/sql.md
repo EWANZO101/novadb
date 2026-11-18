@@ -63,7 +63,7 @@ running random workloads against an indexed and an unindexed copy of the same ta
 
 ## Limits / not yet (by design, later stages)
 * No correlated subqueries, UNION, window functions, CTEs, derived tables (`FROM (SELECT …)`), ALTER TABLE.
-* Transactions (`BEGIN … COMMIT/ROLLBACK`, snapshot isolation): see [transactions.md](transactions.md). DDL still commits implicitly like MySQL; transactional DDL is next ([mysql-pitfalls.md](mysql-pitfalls.md)).
+* Transactions (`BEGIN … COMMIT/ROLLBACK`, snapshot isolation): see [transactions.md](transactions.md). `CREATE/DROP TABLE/INDEX` inside a transaction roll back with it ([transactional DDL](transactions.md#transactional-ddl)); user/GRANT statements still commit implicitly.
 * Sorting, join results, groups and UPDATE/DELETE candidate sets are in memory, capped at
   1,000,000 rows (`MAX_ROWS_IN_MEMORY`); there is no disk spill yet.
 * Collation is binary (case-sensitive `'a' <> 'A'`); MySQL's default is case-insensitive.

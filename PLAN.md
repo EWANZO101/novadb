@@ -1,5 +1,5 @@
 # NovaDB — Build Plan (based on Master Spec v0.2)
-Status (2026-11-18): Stages 1–7 done, Stage 9 dashboard in progress (live), privileges done; next transactional DDL,
+Status (2026-11-18): Stages 1–7 done, Stage 9 dashboard in progress (live), privileges + transactional DDL done; next
 online `ALTER TABLE`, then Stage 8. Current state: [README.md](README.md), results: [TESTING.md](TESTING.md).
 Location: this GitHub repo only (nothing kept on the server, see §6).
 
@@ -28,7 +28,7 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 | Licence | clean-room; do NOT copy MySQL/MariaDB (GPL) source | legal |
 
 ## 3. Stages
-✅ done · 🟡 in progress · ⏳ planned. Extra work from the owner's MySQL-pitfalls list ([docs/mysql-pitfalls.md](docs/mysql-pitfalls.md)): ✅ GRANT/REVOKE privileges → transactional DDL → online `ALTER TABLE` → then Stage 8.
+✅ done · 🟡 in progress · ⏳ planned. Extra work from the owner's MySQL-pitfalls list ([docs/mysql-pitfalls.md](docs/mysql-pitfalls.md)): ✅ GRANT/REVOKE privileges → ✅ transactional DDL → online `ALTER TABLE` → then Stage 8.
 
 - ✅ **Stage 1 (Mon 16 Nov) — skeleton**: cargo workspace (engine, protocol, sql, server, cli), CI (fmt, clippy -D warnings, test, cargo-deny/audit), `#![forbid(unsafe_code)]` everywhere except storage crate.
 - ✅ **Stage 2 — storage**: pager, buffer pool w/ memory cap, B+Tree, WAL, fsync, crash recovery. Crash tests (kill -9 loop + verify).
