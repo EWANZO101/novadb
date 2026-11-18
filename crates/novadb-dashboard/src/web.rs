@@ -102,7 +102,7 @@ async fn security_headers(req: Request<Body>, next: Next) -> Response {
     set(
         h,
         "content-security-policy",
-        "default-src 'none'; style-src 'self'; img-src 'self' data:; form-action 'self' https://discord.com https://github.com; frame-ancestors 'none'; base-uri 'none'",
+        "default-src 'none'; object-src 'none'; style-src 'self'; img-src 'self' data:; form-action 'self' https://discord.com https://github.com; frame-ancestors 'none'; base-uri 'none'",
     );
     set(h, "x-frame-options", "DENY");
     set(h, "x-content-type-options", "nosniff");

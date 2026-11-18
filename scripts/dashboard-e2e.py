@@ -46,6 +46,7 @@ a = C()
 s, h, b = a.req("GET", "/")
 check(s == 303 and h["location"] == "/login", "anonymous / redirects to /login")
 check("frame-ancestors 'none'" in h.get("content-security-policy", ""), "strict CSP present")
+check("object-src 'none'" in h.get("content-security-policy", ""), "CSP restricts object-src explicitly")
 s, h, b = a.req("GET", "/users")
 check(s == 303, "admin page needs login")
 
