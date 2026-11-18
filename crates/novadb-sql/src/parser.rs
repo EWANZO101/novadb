@@ -61,6 +61,11 @@ const RESERVED: &[&str] = &[
 ];
 
 pub fn parse(sql: &str) -> Result<Vec<Stmt>> {
+    parse_prepared(sql).map(|(s, _)| s)
+}
+
+/// Parse and also return the number of `?` placeholders (prepared statements).
+pub fn parse_prepared(sql: &str) -> Result<(Vec<Stmt>, usize)> {
     if sql.len() > MAX_STATEMENT_BYTES {
         return Err(SqlError::resource("statement too large"));
     }
@@ -70,6 +75,7 @@ pub fn parse(sql: &str) -> Result<Vec<Stmt>> {
         toks,
         i: 0,
         depth: 0,
+        params: 0,
     };
     let mut out = Vec::new();
     loop {
@@ -82,7 +88,7 @@ pub fn parse(sql: &str) -> Result<Vec<Stmt>> {
             return Err(p.err("expected ';' or end of statement"));
         }
     }
-    Ok(out)
+    Ok((out, p.params))
 }
 
 struct Parser<'a> {
@@ -90,6 +96,8 @@ struct Parser<'a> {
     toks: Vec<Token>,
     i: usize,
     depth: usize,
+    /// Number of `?` placeholders seen so far.
+    params: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -195,7 +203,208 @@ impl<'a> Parser<'a> {
 
     // ----- statements --------------------------------------------------------------------
 
+    fn user_spec(&mut self) -> Result<String> {
+        let name = match self.bump() {
+            Tok::Str(s) | Tok::QIdent(s) | Tok::Ident(s) => s,
+            _ => {
+                self.i -= 1;
+                return Err(self.err("expected a user name"));
+            }
+        };
+        if self.eat_sym("@") {
+            match self.bump() {
+                Tok::Str(_) | Tok::QIdent(_) | Tok::Ident(_) => {}
+                _ => {
+                    self.i -= 1;
+                    return Err(self.err("expected a host name"));
+                }
+            }
+        }
+        if name.is_empty() || name.chars().count() > 32 || name.chars().any(char::is_control) {
+            return Err(SqlError::bad_ident(&name));
+        }
+        Ok(name)
+    }
+
+    fn password_clause(&mut self) -> Result<String> {
+        self.kw("identified")?;
+        if self.eat_kw("with") {
+            // IDENTIFIED WITH caching_sha2_password BY '...': plugin name accepted, ignored.
+            self.bump();
+        }
+        self.kw("by")?;
+        match self.bump() {
+            Tok::Str(s) => Ok(s),
+            _ => {
+                self.i -= 1;
+                Err(self.err("expected a password string"))
+            }
+        }
+    }
+
+    fn set_stmt(&mut self) -> Result<Stmt> {
+        if self.eat_kw("names") {
+            let cs = match self.bump() {
+                Tok::Str(s) | Tok::Ident(s) | Tok::QIdent(s) => s,
+                _ => return Err(self.err("expected a character set")),
+            };
+            if self.eat_kw("collate") {
+                self.bump();
+            }
+            return Ok(Stmt::Set(vec![(
+                "character_set_client".into(),
+                Expr::Lit(Value::Str(cs)),
+            )]));
+        }
+        if self.eat_kw("character") || self.eat_kw("charset") {
+            let _ = self.eat_kw("set");
+            let cs = match self.bump() {
+                Tok::Str(s) | Tok::Ident(s) | Tok::QIdent(s) => s,
+                _ => return Err(self.err("expected a character set")),
+            };
+            return Ok(Stmt::Set(vec![(
+                "character_set_client".into(),
+                Expr::Lit(Value::Str(cs)),
+            )]));
+        }
+        let _ = self.eat_kw("session") || self.eat_kw("local") || self.eat_kw("global");
+        if self.eat_kw("transaction") {
+            while !self.at_eof() && !matches!(self.peek(), Tok::Sym(";")) {
+                self.bump();
+            }
+            return Ok(Stmt::Set(vec![]));
+        }
+        let mut v = Vec::new();
+        loop {
+            let _ = self.eat_kw("session") || self.eat_kw("local") || self.eat_kw("global");
+            let name = match self.bump() {
+                Tok::SysVar(n) => n,
+                Tok::Ident(n) | Tok::QIdent(n) => n.to_ascii_lowercase(),
+                Tok::Sym("@") => return Err(SqlError::unsupported("user variables")),
+                _ => {
+                    self.i -= 1;
+                    return Err(self.err("expected a variable name"));
+                }
+            };
+            self.sym("=")?;
+            let e = if self.is_kw("on") || self.is_kw("default") || self.is_kw("off") {
+                let k = match self.bump() {
+                    Tok::Ident(k) => k.to_ascii_lowercase(),
+                    _ => String::new(),
+                };
+                Expr::Lit(match k.as_str() {
+                    "on" => Value::Int(1),
+                    "off" => Value::Int(0),
+                    _ => Value::Null,
+                })
+            } else {
+                self.expr()?
+            };
+            v.push((name, e));
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        Ok(Stmt::Set(v))
+    }
+
     fn statement(&mut self) -> Result<Stmt> {
+        if self.eat_kw("set") {
+            return self.set_stmt();
+        }
+        if self.eat_kw("use") {
+            return Ok(Stmt::Use(self.ident()?));
+        }
+        if self.eat_kw("begin") {
+            let _ = self.eat_kw("work");
+            return Ok(Stmt::Txn(TxnKind::Begin));
+        }
+        if self.eat_kw("start") {
+            self.kw("transaction")?;
+            while !self.at_eof() && !matches!(self.peek(), Tok::Sym(";")) {
+                self.bump();
+            }
+            return Ok(Stmt::Txn(TxnKind::Begin));
+        }
+        if self.eat_kw("commit") {
+            let _ = self.eat_kw("work");
+            return Ok(Stmt::Txn(TxnKind::Commit));
+        }
+        if self.eat_kw("rollback") {
+            let _ = self.eat_kw("work");
+            return Ok(Stmt::Txn(TxnKind::Rollback));
+        }
+        if self.is_kw("create") && self.is_kw_at(1, "user") {
+            self.i += 2;
+            let if_not_exists = if self.eat_kw("if") {
+                self.kw("not")?;
+                self.kw("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.user_spec()?;
+            let password = self.password_clause()?;
+            return Ok(Stmt::CreateUser {
+                name,
+                password,
+                if_not_exists,
+            });
+        }
+        if self.is_kw("alter") && self.is_kw_at(1, "user") {
+            self.i += 2;
+            let if_exists = if self.eat_kw("if") {
+                self.kw("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.user_spec()?;
+            let password = self.password_clause()?;
+            return Ok(Stmt::AlterUser {
+                name,
+                password,
+                if_exists,
+            });
+        }
+        if self.is_kw("drop") && self.is_kw_at(1, "user") {
+            self.i += 2;
+            let if_exists = if self.eat_kw("if") {
+                self.kw("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = vec![self.user_spec()?];
+            while self.eat_sym(",") {
+                names.push(self.user_spec()?);
+            }
+            return Ok(Stmt::DropUser { names, if_exists });
+        }
+        if self.is_kw("show") {
+            let save = self.i;
+            self.i += 1;
+            let _ = self.eat_kw("session") || self.eat_kw("global") || self.eat_kw("full");
+            if self.eat_kw("databases") || self.eat_kw("schemas") {
+                return Ok(Stmt::ShowDatabases);
+            }
+            if self.eat_kw("warnings") || self.eat_kw("errors") {
+                return Ok(Stmt::ShowWarnings);
+            }
+            let status = self.is_kw("status");
+            if self.eat_kw("variables") || self.eat_kw("status") {
+                let like = if self.eat_kw("like") {
+                    match self.bump() {
+                        Tok::Str(s) => Some(s),
+                        _ => return Err(self.err("expected a pattern string")),
+                    }
+                } else {
+                    None
+                };
+                return Ok(Stmt::ShowVariables { like, status });
+            }
+            self.i = save;
+        }
         if self.eat_kw("select") {
             return Ok(Stmt::Select(self.select()?));
         }
@@ -944,6 +1153,21 @@ impl<'a> Parser<'a> {
                 self.i += 1;
                 Ok(Expr::Lit(Value::Bytes(b)))
             }
+            Tok::Sym("?") => {
+                self.i += 1;
+                self.params += 1;
+                if self.params > u16::MAX as usize {
+                    return Err(self.err("too many placeholders"));
+                }
+                Ok(Expr::Param(self.params - 1))
+            }
+            Tok::SysVar(n) => {
+                self.i += 1;
+                Ok(Expr::Func {
+                    name: "__sysvar".into(),
+                    args: vec![Expr::Lit(Value::Str(n))],
+                })
+            }
             Tok::Sym("(") => {
                 self.i += 1;
                 let e = self.expr()?;
@@ -1102,6 +1326,50 @@ mod tests {
         assert_eq!(parse(&deep_not).unwrap_err().code, 1064);
         let deep_neg = format!("select {}1", "- ".repeat(5000));
         assert_eq!(parse(&deep_neg).unwrap_err().code, 1064);
+    }
+
+    #[test]
+    fn client_statements() {
+        let (v, n) = parse_prepared("SELECT * FROM t WHERE a = ? AND b IN (?, ?)").unwrap();
+        assert_eq!((v.len(), n), (1, 3));
+        assert!(
+            matches!(one("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci"), Stmt::Set(v) if v.len() == 1)
+        );
+        assert!(
+            matches!(one("SET autocommit=0, @@session.sql_mode = 'STRICT_ALL_TABLES', SESSION wait_timeout = 10"), Stmt::Set(v) if v.len() == 3 && v[0].0 == "autocommit" && v[1].0 == "sql_mode")
+        );
+        assert!(
+            matches!(one("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"), Stmt::Set(v) if v.is_empty())
+        );
+        assert_eq!(parse("SET @x = 1").unwrap_err().code, 1235);
+        assert!(matches!(one("USE `novadb`"), Stmt::Use(d) if d == "novadb"));
+        assert!(matches!(
+            one("START TRANSACTION READ WRITE"),
+            Stmt::Txn(TxnKind::Begin)
+        ));
+        assert!(matches!(one("rollback"), Stmt::Txn(TxnKind::Rollback)));
+        assert!(
+            matches!(one("CREATE USER IF NOT EXISTS 'app'@'%' IDENTIFIED BY 'pw'"), Stmt::CreateUser { name, password, if_not_exists: true } if name == "app" && password == "pw")
+        );
+        assert!(matches!(
+            one("ALTER USER app@localhost IDENTIFIED WITH caching_sha2_password BY 'x'"),
+            Stmt::AlterUser { .. }
+        ));
+        assert!(
+            matches!(one("DROP USER 'a', 'b'@'h'"), Stmt::DropUser { names, .. } if names.len() == 2)
+        );
+        assert!(matches!(
+            one("SHOW SESSION VARIABLES LIKE 'version%'"),
+            Stmt::ShowVariables {
+                like: Some(_),
+                status: false
+            }
+        ));
+        assert!(matches!(one("SHOW DATABASES"), Stmt::ShowDatabases));
+        assert!(matches!(
+            one("SELECT @@version_comment LIMIT 1"),
+            Stmt::Select(_)
+        ));
     }
 
     #[test]

@@ -5,6 +5,27 @@ All builds and tests run **inside Docker** (`novadb-builder`, `--cpus 2 --memory
 Toolchain: rustc 1.100.0 stable, nightly 2026-11-11 for cargo-fuzz; cargo-deny 0.20.2,
 cargo-audit 0.23.0, cargo-nextest 0.9.152.
 
+## 2026-11-18 — Stage 4 (MySQL wire protocol over TLS)
+Details: [docs/protocol.md](docs/protocol.md). New deps: tokio, tokio-rustls/rustls (ring), rcgen, argon2.
+
+| check | result |
+|---|---|
+| unit tests (protocol 9, server 3, SQL 20 + 10 integration) | ✅ |
+| clippy `-D warnings`, cargo-deny, cargo-audit (175 crates) | ✅ |
+| security-check (new: no `mysql_native_password`, no wildcard bind) | ✅ |
+| `mariadb` CLI over TLS: sysvars, DDL/DML, LAST_INSERT_ID, DATETIME(3), errors 1146/1062 | ✅ |
+| Node `mysql2` 3.11: 20 checks (prepared + binary rows, DECIMAL/DATETIME/BLOB/UTF-8/NULL, multi-statements, CREATE USER + login, weak/wrong password, plaintext refused) | ✅ 20/20 |
+| `scripts/protocol-abuse.py`: >64 KiB pre-auth packet, garbage, 10 s handshake timeout, 33-connection flood → 1040, brute force → 1129 | ✅ 7/7 |
+| `scripts/wire-test.sh` in the builder image | ✅ 15 checks |
+| fuzz `protocol_decode` 60 s | ✅ 896,860 runs, no crash |
+
+Bugs found while building: OK-packet info string must be length-prefixed (MariaDB client said
+"malformed packet" on UPDATE); two security-check hits (a doc comment naming the wildcard
+address, a test using the SHA1 plugin name) — fixed by rewording, rules left strict.
+
+Known limits: no privileges yet (every user is all-powerful), no `information_schema` (GUI tools),
+ROLLBACK errors until Stage 5, one database (`novadb`).
+
 ## 2026-11-18 — Stage 3 (single-node SQL)
 Details: [docs/sql.md](docs/sql.md). Hand-written lexer/parser/executor, no new dependencies.
 

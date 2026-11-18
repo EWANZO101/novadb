@@ -62,10 +62,31 @@ impl QueryResult {
 }
 
 type Clock = Box<dyn Fn() -> i64 + Send>;
+/// Turns a plaintext password into a stored hash (the server plugs in Argon2id).
+pub type PasswordHasher = Box<dyn Fn(&str) -> std::result::Result<String, String> + Send>;
+
+/// Per-connection state visible to SQL (CURRENT_USER(), CONNECTION_ID(), LAST_INSERT_ID()).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Session {
+    pub user: String,
+    pub conn_id: u32,
+    pub last_insert_id: u64,
+}
+
+pub const USERS_TREE: &str = "sql:users";
+pub const PW_MIN: usize = 12;
+pub const PW_MAX: usize = 128;
+
+thread_local! {
+    // The session of the statement currently executing on this thread (set by `run_in`).
+    static CURRENT: std::cell::RefCell<Session> = std::cell::RefCell::new(Session::default());
+}
 
 pub struct Engine {
     db: Db,
     clock: Clock,
+    hasher: Option<PasswordHasher>,
+    default_session: Session,
 }
 
 fn system_now() -> i64 {
@@ -80,12 +101,16 @@ impl Engine {
         Ok(Engine {
             db: Db::open(dir, Options::default())?,
             clock: Box::new(system_now),
+            hasher: None,
+            default_session: Session::default(),
         })
     }
     pub fn open_vfs(vfs: Box<dyn Vfs>, opts: Options) -> Result<Engine> {
         Ok(Engine {
             db: Db::open_vfs(vfs, opts)?,
             clock: Box::new(system_now),
+            hasher: None,
+            default_session: Session::default(),
         })
     }
     /// Replace the clock used by NOW()/CURRENT_TIMESTAMP (tests).
@@ -119,7 +144,145 @@ impl Engine {
         Ok(v.remove(0))
     }
 
+    /// Install the password hasher used by CREATE/ALTER USER.
+    pub fn with_password_hasher(
+        mut self,
+        f: impl Fn(&str) -> std::result::Result<String, String> + Send + 'static,
+    ) -> Self {
+        self.hasher = Some(Box::new(f));
+        self
+    }
+
+    /// Stored password hash for `user` (None if no such user).
+    pub fn user_hash(&mut self, user: &str) -> Result<Option<String>> {
+        let k = user.to_lowercase();
+        let v = self.db.view(|tx| match tx.open_tree(USERS_TREE) {
+            Ok(t) => tx.get(&t, k.as_bytes()),
+            Err(novadb_storage::Error::TreeNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        })?;
+        v.map(|b| String::from_utf8(b).map_err(|_| SqlError::corrupt("users: invalid hash")))
+            .transpose()
+    }
+
+    /// Names of all SQL users (lowercase).
+    pub fn users(&mut self) -> Result<Vec<String>> {
+        let v = self.db.view(|tx| match tx.open_tree(USERS_TREE) {
+            Ok(t) => tx
+                .range(&t, ..)?
+                .map(|r| r.map(|(k, _)| k))
+                .collect::<novadb_storage::Result<Vec<_>>>(),
+            Err(novadb_storage::Error::TreeNotFound(_)) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        })?;
+        Ok(v.into_iter()
+            .map(|k| String::from_utf8_lossy(&k).into_owned())
+            .collect())
+    }
+
+    /// Store an already-hashed password (bootstrap / ALTER USER).
+    pub fn set_user_hash(&mut self, user: &str, hash: &str) -> Result<()> {
+        let k = user.to_lowercase();
+        self.db.update(|tx| {
+            let t = tx.open_or_create_tree(USERS_TREE)?;
+            tx.put(&t, k.as_bytes(), hash.as_bytes()).map(|_| ())
+        })?;
+        Ok(())
+    }
+
+    fn hash(&self, pw: &str) -> Result<String> {
+        let n = pw.chars().count();
+        if !(PW_MIN..=PW_MAX).contains(&n) {
+            return Err(SqlError::weak_password());
+        }
+        match &self.hasher {
+            Some(h) => h(pw).map_err(SqlError::internal),
+            None => Err(SqlError::unsupported("user management outside the server")),
+        }
+    }
+
+    fn user_stmt(&mut self, s: &Stmt) -> Result<QueryResult> {
+        match s {
+            Stmt::CreateUser {
+                name,
+                password,
+                if_not_exists,
+            } => {
+                if self.user_hash(name)?.is_some() {
+                    if *if_not_exists {
+                        return Ok(QueryResult::ok(0));
+                    }
+                    return Err(SqlError::user_op("CREATE USER", name));
+                }
+                let h = self.hash(password)?;
+                self.set_user_hash(name, &h)?;
+            }
+            Stmt::AlterUser {
+                name,
+                password,
+                if_exists,
+            } => {
+                if self.user_hash(name)?.is_none() {
+                    if *if_exists {
+                        return Ok(QueryResult::ok(0));
+                    }
+                    return Err(SqlError::user_op("ALTER USER", name));
+                }
+                let h = self.hash(password)?;
+                self.set_user_hash(name, &h)?;
+            }
+            Stmt::DropUser { names, if_exists } => {
+                let all = self.users()?;
+                let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+                if let Some(m) = lower.iter().find(|n| !all.contains(n))
+                    && !*if_exists
+                {
+                    return Err(SqlError::user_op("DROP USER", m));
+                }
+                if all.iter().all(|u| lower.contains(u)) {
+                    return Err(SqlError::user_op(
+                        "DROP USER (would remove the last user)",
+                        &names.join(","),
+                    ));
+                }
+                self.db.update(|tx| {
+                    let t = tx.open_or_create_tree(USERS_TREE)?;
+                    for n in &lower {
+                        tx.delete(&t, n.as_bytes())?;
+                    }
+                    Ok(())
+                })?;
+            }
+            _ => return Err(SqlError::internal("not a user statement")),
+        }
+        Ok(QueryResult::ok(0))
+    }
+
+    /// Run one statement for a connection's session.
+    pub fn run_in(&mut self, s: &Stmt, sess: &mut Session) -> Result<QueryResult> {
+        CURRENT.with(|c| *c.borrow_mut() = sess.clone());
+        let r = match s {
+            Stmt::CreateUser { .. } | Stmt::AlterUser { .. } | Stmt::DropUser { .. } => {
+                self.user_stmt(s)
+            }
+            _ => self.run_raw(s),
+        };
+        if let Ok(q) = &r
+            && q.last_insert_id > 0
+        {
+            sess.last_insert_id = q.last_insert_id;
+        }
+        r
+    }
+
     pub fn run(&mut self, s: &Stmt) -> Result<QueryResult> {
+        let mut sess = std::mem::take(&mut self.default_session);
+        let r = self.run_in(s, &mut sess);
+        self.default_session = sess;
+        r
+    }
+
+    fn run_raw(&mut self, s: &Stmt) -> Result<QueryResult> {
         let now = (self.clock)();
         let mut tx = self.db.begin()?;
         let r = run_stmt(&mut tx, s, now);
@@ -129,6 +292,12 @@ impl Engine {
                 Ok(_),
                 Stmt::Select(_)
                 | Stmt::ShowTables
+                | Stmt::ShowDatabases
+                | Stmt::ShowVariables { .. }
+                | Stmt::ShowWarnings
+                | Stmt::Set(_)
+                | Stmt::Use(_)
+                | Stmt::Txn(_)
                 | Stmt::Describe(_)
                 | Stmt::ShowCreateTable(_)
                 | Stmt::Explain(_),
@@ -170,6 +339,44 @@ fn run_stmt(tx: &mut Tx<'_>, s: &Stmt, now: i64) -> Result<QueryResult> {
         Stmt::Describe(t) => describe(tx, t),
         Stmt::ShowCreateTable(t) => show_create(tx, t),
         Stmt::Explain(inner) => explain(tx, inner, now),
+        Stmt::ShowDatabases => Ok(QueryResult {
+            columns: meta(&["Database"]),
+            rows: vec![vec![Value::Str("novadb".into())]],
+            ..Default::default()
+        }),
+        Stmt::ShowWarnings => Ok(QueryResult {
+            columns: meta(&["Level", "Code", "Message"]),
+            ..Default::default()
+        }),
+        Stmt::ShowVariables { like, status } => show_variables(like.as_deref(), *status),
+        Stmt::Use(db) => {
+            if db.eq_ignore_ascii_case("novadb") {
+                Ok(QueryResult::ok(0))
+            } else {
+                Err(SqlError::unknown_db(db))
+            }
+        }
+        Stmt::Set(assignments) => {
+            let env = Env {
+                t: None,
+                row: &[],
+                now,
+            };
+            for (name, e) in assignments {
+                if !SETTABLE.contains(&name.as_str()) {
+                    return Err(SqlError::unknown_sysvar(name));
+                }
+                eval(e, &env)?;
+            }
+            Ok(QueryResult::ok(0))
+        }
+        Stmt::Txn(TxnKind::Begin | TxnKind::Commit) => Ok(QueryResult::ok(0)),
+        Stmt::Txn(TxnKind::Rollback) => Err(SqlError::unsupported(
+            "ROLLBACK: multi-statement transactions arrive in Stage 5; every statement is committed when it finishes",
+        )),
+        Stmt::CreateUser { .. } | Stmt::AlterUser { .. } | Stmt::DropUser { .. } => Err(
+            SqlError::internal("user statements run through Engine::run_in"),
+        ),
     }
 }
 
@@ -466,6 +673,7 @@ fn tv(b: Option<bool>) -> Value {
 fn eval(e: &Expr, env: &Env<'_>) -> Result<Value> {
     Ok(match e {
         Expr::Lit(v) => v.clone(),
+        Expr::Param(_) => return Err(SqlError::param_count()),
         Expr::Col(c) => {
             let i = env
                 .t
@@ -788,6 +996,25 @@ fn func(name: &str, args: &[Expr], env: &Env<'_>) -> Result<Value> {
             };
             let end = (start + take).min(len);
             Value::Str(chars[start as usize..end as usize].iter().collect())
+        }
+        "__sysvar" => {
+            let n = arg(0)?.text().unwrap_or_default();
+            sysvar(&n).ok_or_else(|| SqlError::unknown_sysvar(&n))?
+        }
+        "current_user" | "user" | "session_user" | "system_user" => {
+            need(n == 0)?;
+            Value::Str(format!(
+                "{}@localhost",
+                CURRENT.with(|c| c.borrow().user.clone())
+            ))
+        }
+        "connection_id" => {
+            need(n == 0)?;
+            Value::Int(i64::from(CURRENT.with(|c| c.borrow().conn_id)))
+        }
+        "last_insert_id" => {
+            need(n == 0)?;
+            Value::Int(CURRENT.with(|c| c.borrow().last_insert_id) as i64)
         }
         "__is_true" => Value::bool(arg(0)?.truth() == Some(true)),
         "__is_false" => Value::bool(arg(0)?.truth() == Some(false)),
@@ -2099,4 +2326,122 @@ impl SqlError {
         e.msg = format!("Unknown table '{}'", names.join(","));
         e
     }
+}
+
+/// Variables clients may SET. Values are accepted but behaviour stays fixed (strict mode,
+/// utf8mb4, autocommit) — see docs/protocol.md.
+const SETTABLE: &[&str] = &[
+    "autocommit",
+    "character_set_client",
+    "character_set_connection",
+    "character_set_results",
+    "collation_connection",
+    "names",
+    "sql_mode",
+    "time_zone",
+    "transaction_isolation",
+    "tx_isolation",
+    "wait_timeout",
+    "interactive_timeout",
+    "net_read_timeout",
+    "net_write_timeout",
+    "sql_safe_updates",
+    "foreign_key_checks",
+    "unique_checks",
+    "max_execution_time",
+    "sql_auto_is_null",
+    "group_concat_max_len",
+    "session_track_schema",
+    "session_track_state_change",
+    "session_track_system_variables",
+    "sql_select_limit",
+    "sql_notes",
+    "sql_quote_show_create",
+    "transaction_read_only",
+    "tx_read_only",
+    "default_storage_engine",
+    "lc_messages",
+    "innodb_lock_wait_timeout",
+];
+
+fn sysvars() -> Vec<(&'static str, Value)> {
+    let s = |v: &str| Value::Str(v.to_string());
+    let i = Value::Int;
+    vec![
+        ("auto_increment_increment", i(1)),
+        ("auto_increment_offset", i(1)),
+        ("autocommit", i(1)),
+        ("character_set_client", s("utf8mb4")),
+        ("character_set_connection", s("utf8mb4")),
+        ("character_set_database", s("utf8mb4")),
+        ("character_set_results", s("utf8mb4")),
+        ("character_set_server", s("utf8mb4")),
+        ("collation_connection", s("utf8mb4_bin")),
+        ("collation_database", s("utf8mb4_bin")),
+        ("collation_server", s("utf8mb4_bin")),
+        ("default_storage_engine", s("NovaDB")),
+        ("init_connect", s("")),
+        ("interactive_timeout", i(28800)),
+        ("license", s("Proprietary")),
+        ("lower_case_table_names", i(1)),
+        ("max_allowed_packet", i(67_108_864)),
+        ("net_buffer_length", i(16384)),
+        ("net_write_timeout", i(60)),
+        ("performance_schema", i(0)),
+        ("port", i(3307)),
+        ("protocol_version", i(10)),
+        ("query_cache_size", i(0)),
+        ("query_cache_type", s("OFF")),
+        ("require_secure_transport", s("ON")),
+        (
+            "sql_mode",
+            s("STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"),
+        ),
+        (
+            "sql_select_limit",
+            Value::Dec {
+                v: 18_446_744_073_709_551_615,
+                s: 0,
+            },
+        ),
+        ("system_time_zone", s("UTC")),
+        ("time_zone", s("SYSTEM")),
+        ("transaction_isolation", s("REPEATABLE-READ")),
+        ("transaction_read_only", i(0)),
+        ("tx_isolation", s("REPEATABLE-READ")),
+        ("tx_read_only", i(0)),
+        (
+            "version",
+            s(concat!("8.0.0-NovaDB-", env!("CARGO_PKG_VERSION"))),
+        ),
+        ("version_comment", s("NovaDB")),
+        ("version_compile_os", s("Linux")),
+        ("wait_timeout", i(28800)),
+    ]
+}
+
+fn sysvar(name: &str) -> Option<Value> {
+    sysvars()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| v)
+}
+
+fn show_variables(like_pat: Option<&str>, status: bool) -> Result<QueryResult> {
+    let mut rows = Vec::new();
+    if !status {
+        for (n, v) in sysvars() {
+            if like_pat.is_none_or(|p| like(n, &p.to_lowercase())) {
+                rows.push(vec![
+                    Value::Str(n.into()),
+                    Value::Str(v.text().unwrap_or_default()),
+                ]);
+            }
+        }
+    }
+    Ok(QueryResult {
+        columns: meta(&["Variable_name", "Value"]),
+        rows,
+        ..Default::default()
+    })
 }

@@ -24,9 +24,10 @@ pub mod lexer;
 pub mod parser;
 pub mod value;
 
+pub use ast::bind_params;
 pub use error::{Result, SqlError};
-pub use exec::{ColumnMeta, Engine, QueryResult};
-pub use parser::parse;
+pub use exec::{ColumnMeta, Engine, QueryResult, Session};
+pub use parser::{parse, parse_prepared};
 pub use value::{ColType, Value};
 
 /// Maximum nesting depth of expressions before the parser returns an error

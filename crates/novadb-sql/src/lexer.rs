@@ -20,6 +20,8 @@ pub enum Tok {
     Str(String),
     /// `X'..'` / `0x..` literal.
     Hex(Vec<u8>),
+    /// `@@[session.|global.|local.]name` (lowercased name, scope dropped).
+    SysVar(String),
     /// Punctuation / operator.
     Sym(&'static str),
     Eof,
@@ -289,6 +291,38 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
             i = j;
             continue;
         }
+        if c == b'@' {
+            if b.get(i + 1) == Some(&b'@') {
+                let mut j = i + 2;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'.')
+                {
+                    j += 1;
+                }
+                let full = sql[i + 2..j].to_ascii_lowercase();
+                let name = ["session.", "global.", "local."]
+                    .iter()
+                    .find_map(|p| full.strip_prefix(p))
+                    .unwrap_or(&full)
+                    .to_string();
+                if name.is_empty() || name.contains('.') {
+                    return Err(err(start, "invalid system variable"));
+                }
+                out.push(Token {
+                    tok: Tok::SysVar(name),
+                    pos: start,
+                    end: j,
+                });
+                i = j;
+                continue;
+            }
+            out.push(Token {
+                tok: Tok::Sym("@"),
+                pos: start,
+                end: i + 1,
+            });
+            i += 1;
+            continue;
+        }
         let rest = &sql[i..];
         match SYMS.iter().find(|s| rest.starts_with(**s)) {
             Some(s) => {
@@ -362,7 +396,20 @@ mod tests {
 
     #[test]
     fn errors() {
-        for bad in ["'abc", "`abc", "/* x", "X'abc'", "1abc", "@", "\"\\"] {
+        assert_eq!(
+            toks("@@SESSION.Auto_Increment_Increment @@version 'u'@'h'"),
+            vec![
+                Tok::SysVar("auto_increment_increment".into()),
+                Tok::SysVar("version".into()),
+                Tok::Str("u".into()),
+                Tok::Sym("@"),
+                Tok::Str("h".into()),
+                Tok::Eof
+            ]
+        );
+        for bad in [
+            "'abc", "`abc", "/* x", "X'abc'", "1abc", "@@", "@@a.b.c", "\"\\",
+        ] {
             assert!(lex(bad).is_err(), "{bad}");
         }
     }

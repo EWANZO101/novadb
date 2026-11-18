@@ -25,5 +25,6 @@ HOST=$(rustc -vV | sed -n 's/^host: //p')
 if [ -d fuzz ]; then for t in $(cd fuzz && cargo +nightly fuzz list 2>/dev/null); do
   step "fuzz:$t (${FUZZ_SECS:-60}s)" bash -c "cd fuzz && cargo +nightly fuzz run --target $HOST $t -- -max_total_time=${FUZZ_SECS:-60} -rss_limit_mb=2048"; done; fi
 [ -x scripts/crash-test.sh ] && step "crash-recovery" scripts/crash-test.sh
+[ -x scripts/wire-test.sh ] && step "wire-protocol (mariadb client + abuse)" scripts/wire-test.sh
 cat $R; [ -d /out ] && cp $R /out/report.md
 exit $FAIL

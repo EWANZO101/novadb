@@ -1037,7 +1037,7 @@ async fn overview(
             "SQL single-node: tables, indexes, planner, CLI shell",
             "done",
         ),
-        ("4", "MySQL wire protocol (127.0.0.1:3307)", "planned"),
+        ("4", "MySQL wire protocol over TLS (127.0.0.1:3307)", "done"),
         ("5", "Transactions (MVCC)", "planned"),
         ("6", "Joins, aggregates, planner", "planned"),
         ("7", "Ops: backups, PITR, metrics", "planned"),
@@ -1079,7 +1079,7 @@ async fn overview(
 <tr><td>Buffer pool</td><td>{} pages ({})</td></tr></table>
 <p class="hint">The dashboard keeps its own users, sessions and audit log in NovaDB's storage engine.</p></div>
 <div class="card"><h2>Engine roadmap</h2><table><tr><th>#</th><th>Stage</th><th></th></tr>{stage_rows}</table>
-<p class="hint">SQL works locally through the <code>novadb</code> CLI shell; the network server (port 3307) and database screens here arrive with Stage 4.</p></div></div>"#,
+<p class="hint">SQL works through the <code>novadb</code> shell and any MySQL client over TLS on 127.0.0.1:3307. Database screens here come next.</p></div></div>"#,
         esc(&c.user.name),
         html::ago(t, c.user.last_login),
         html::ago(t, app.started).replace(" ago", ""),

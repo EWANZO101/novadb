@@ -1,5 +1,6 @@
 [package]
 name = "novadb-server"
+description = "NovaDB server: MySQL wire protocol over TLS on 127.0.0.1:3307"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +13,9 @@ workspace = true
 [dependencies]
 novadb-storage.workspace = true
 novadb-protocol.workspace = true
+novadb-sql.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+argon2 = "0.5"
+getrandom = "0.2"

@@ -152,6 +152,36 @@ impl SqlError {
             "Incorrect table definition; there can be only one auto column and it must be defined as a key",
         )
     }
+    pub fn param_count() -> Self {
+        Self::new(1210, "HY000", "Incorrect arguments to mysqld_stmt_execute")
+    }
+    pub fn unknown_db(d: &str) -> Self {
+        Self::new(1049, "42000", format!("Unknown database '{d}'"))
+    }
+    pub fn unknown_sysvar(v: &str) -> Self {
+        Self::new(1193, "HY000", format!("Unknown system variable '{v}'"))
+    }
+    pub fn user_op(op: &str, u: &str) -> Self {
+        Self::new(
+            1396,
+            "HY000",
+            format!("Operation {op} failed for '{u}'@'%'"),
+        )
+    }
+    pub fn weak_password() -> Self {
+        Self::new(
+            1819,
+            "HY000",
+            "Your password does not satisfy the current policy requirements (12-128 characters)",
+        )
+    }
+    pub fn access_denied(u: &str) -> Self {
+        Self::new(
+            1045,
+            "28000",
+            format!("Access denied for user '{u}'@'localhost' (using password: YES)"),
+        )
+    }
     pub fn corrupt(msg: impl Into<String>) -> Self {
         Self::new(
             1030,

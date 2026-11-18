@@ -39,9 +39,41 @@ pub enum Stmt {
         limit: Option<u64>,
     },
     ShowTables,
+    ShowDatabases,
+    /// SHOW [SESSION|GLOBAL] VARIABLES / STATUS [LIKE 'pattern']
+    ShowVariables {
+        like: Option<String>,
+        status: bool,
+    },
+    ShowWarnings,
+    /// SET var = expr, ... (names lowercased; NAMES / CHARACTER SET map to character_set_client)
+    Set(Vec<(String, Expr)>),
+    Use(String),
+    Txn(TxnKind),
+    CreateUser {
+        name: String,
+        password: String,
+        if_not_exists: bool,
+    },
+    AlterUser {
+        name: String,
+        password: String,
+        if_exists: bool,
+    },
+    DropUser {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     Describe(String),
     ShowCreateTable(String),
     Explain(Box<Stmt>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnKind {
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +166,8 @@ pub enum UnOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Lit(Value),
+    /// `?` placeholder (0-based, in order of appearance); replaced by `bind_params`.
+    Param(usize),
     Col(String),
     Unary {
         op: UnOp,
@@ -174,7 +208,7 @@ impl Expr {
     /// Visit every column reference.
     pub fn columns<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {
-            Expr::Lit(_) => {}
+            Expr::Lit(_) | Expr::Param(_) => {}
             Expr::Col(c) => out.push(c),
             Expr::Unary { e, .. } | Expr::IsNull { e, .. } => e.columns(out),
             Expr::Binary { l, r, .. } => {
@@ -202,5 +236,113 @@ impl Expr {
                 }
             }
         }
+    }
+}
+
+/// Apply `f` to every expression in `e` (pre-order, mutable).
+pub fn walk_expr_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    f(e);
+    match e {
+        Expr::Lit(_) | Expr::Param(_) | Expr::Col(_) => {}
+        Expr::Unary { e, .. } | Expr::IsNull { e, .. } => walk_expr_mut(e, f),
+        Expr::Binary { l, r, .. } => {
+            walk_expr_mut(l, f);
+            walk_expr_mut(r, f);
+        }
+        Expr::InList { e, list, .. } => {
+            walk_expr_mut(e, f);
+            for x in list {
+                walk_expr_mut(x, f);
+            }
+        }
+        Expr::Between { e, lo, hi, .. } => {
+            walk_expr_mut(e, f);
+            walk_expr_mut(lo, f);
+            walk_expr_mut(hi, f);
+        }
+        Expr::Like { e, pat, .. } => {
+            walk_expr_mut(e, f);
+            walk_expr_mut(pat, f);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                walk_expr_mut(a, f);
+            }
+        }
+    }
+}
+
+/// Apply `f` to every expression of a statement.
+pub fn walk_stmt_mut(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+    let order = |o: &mut Vec<OrderBy>, f: &mut dyn FnMut(&mut Expr)| {
+        for x in o {
+            walk_expr_mut(&mut x.expr, f);
+        }
+    };
+    match s {
+        Stmt::Insert { rows, .. } => {
+            for r in rows {
+                for e in r {
+                    walk_expr_mut(e, f);
+                }
+            }
+        }
+        Stmt::Select(sel) => {
+            for it in &mut sel.items {
+                if let SelectItem::Expr { expr, .. } = it {
+                    walk_expr_mut(expr, f);
+                }
+            }
+            if let Some(w) = &mut sel.filter {
+                walk_expr_mut(w, f);
+            }
+            order(&mut sel.order, f);
+        }
+        Stmt::Update {
+            sets,
+            filter,
+            order: o,
+            ..
+        } => {
+            for (_, e) in sets {
+                walk_expr_mut(e, f);
+            }
+            if let Some(w) = filter {
+                walk_expr_mut(w, f);
+            }
+            order(o, f);
+        }
+        Stmt::Delete {
+            filter, order: o, ..
+        } => {
+            if let Some(w) = filter {
+                walk_expr_mut(w, f);
+            }
+            order(o, f);
+        }
+        Stmt::Set(v) => {
+            for (_, e) in v {
+                walk_expr_mut(e, f);
+            }
+        }
+        Stmt::Explain(inner) => walk_stmt_mut(inner, f),
+        _ => {}
+    }
+}
+
+/// Replace `?` placeholders with values. Errors if the count does not match.
+pub fn bind_params(s: &mut Stmt, vals: &[Value]) -> Result<(), crate::SqlError> {
+    let mut bad = None;
+    walk_stmt_mut(s, &mut |e| {
+        if let Expr::Param(i) = e {
+            match vals.get(*i) {
+                Some(v) => *e = Expr::Lit(v.clone()),
+                None => bad = Some(*i),
+            }
+        }
+    });
+    match bad {
+        Some(_) => Err(crate::SqlError::param_count()),
+        None => Ok(()),
     }
 }

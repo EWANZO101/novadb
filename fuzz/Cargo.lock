@@ -74,8 +74,16 @@ name = "novadb-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "novadb-protocol",
  "novadb-sql",
  "novadb-storage",
+]
+
+[[package]]
+name = "novadb-protocol"
+version = "0.1.0"
+dependencies = [
+ "novadb-sql",
 ]
 
 [[package]]

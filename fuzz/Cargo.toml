@@ -12,6 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 novadb-storage = { path = "../crates/novadb-storage" }
 novadb-sql = { path = "../crates/novadb-sql" }
+novadb-protocol = { path = "../crates/novadb-protocol" }
 
 # Not part of the main workspace (needs nightly + sanitizers).
 [workspace]
@@ -66,6 +67,13 @@ bench = false
 [[bin]]
 name = "sql_exec"
 path = "fuzz_targets/sql_exec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
 test = false
 doc = false
 bench = false
