@@ -52,6 +52,6 @@ OAuth redirect URIs to register: `<public url>/oauth/discord/callback`, `<public
 * `cargo test -p novadb-dashboard` — TOTP RFC 6238 vectors + replay, base32, PKCE RFC 7636 vector,
   Argon2id parameters, password policy, rate limiter, HTML escaping, audit-chain tamper/delete
   detection, persistence of users/sessions/links across reopen, OAuth state single-use.
-* `scripts/dashboard-e2e.py` — 33 black-box checks against a **throwaway** instance (forced setup,
+* `scripts/dashboard-e2e.py` — 37 black-box checks (incl. browser-style Origin/Sec-Fetch-Site) against a **throwaway** instance (forced setup,
   CSRF/Origin, roles, TOTP replay, session revocation, logout, audit chain, no secrets in log,
   HTTP 429 on brute force).

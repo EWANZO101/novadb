@@ -13,11 +13,12 @@ Built at the owner's request ahead of Stages 3–8. Details: [docs/dashboard.md]
 | `cargo test -p novadb-dashboard` | ✅ 14/14 (TOTP RFC 6238 vectors + replay, PKCE RFC 7636, Argon2id params, policy, limiter, escaping, audit tamper/delete detection, persistence, OAuth state single-use) |
 | clippy `-D warnings` (all targets) | ✅ (`result_large_err` allowed in `web.rs` only: axum `Result<Response, Response>` handlers) |
 | cargo-deny / cargo-audit | ✅ advisories, bans, licences, sources ok (warnings: duplicate `base64`, `windows-sys`) |
-| `scripts/dashboard-e2e.py` on a throwaway container | ✅ 33/33 |
+| `scripts/dashboard-e2e.py` on a throwaway container | ✅ 37/37 |
 | one-time admin password file | ✅ 0600, deleted after first password change |
 | Pre-existing Stage 1+2 suite (fresh clone, commit df1b48b, FUZZ_SECS=60) | ✅ 15/15 |
 
 Bugs found while building: wrong expected value in my own PKCE test (code was right; vector re-checked with openssl).
+Bug found live: `Referrer-Policy: no-referrer` makes browsers send `Origin: null` on form POSTs, so the Origin check blocked every real login ("Cross-site request blocked"). Fixed: policy `same-origin`; `Origin: null` accepted only with `Sec-Fetch-Site: same-origin`. e2e now sends browser-style headers (4 new checks).
 
 Open: passkeys/WebAuthn, recovery codes, OAuth live test needs Discord/GitHub app credentials,
 per-database permissions (Stage 3+), REST tokens (Stage 10).

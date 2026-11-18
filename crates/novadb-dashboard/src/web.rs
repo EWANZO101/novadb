@@ -106,7 +106,8 @@ async fn security_headers(req: Request<Body>, next: Next) -> Response {
     );
     set(h, "x-frame-options", "DENY");
     set(h, "x-content-type-options", "nosniff");
-    set(h, "referrer-policy", "no-referrer");
+    // same-origin (not no-referrer): no-referrer makes browsers send `Origin: null` on form POSTs.
+    set(h, "referrer-policy", "same-origin");
     set(h, "cache-control", "no-store");
     set(
         h,
@@ -196,13 +197,14 @@ fn internal(e: String) -> Response {
 
 /// Reject cross-site POSTs (defence in depth next to CSRF tokens + SameSite).
 fn origin_ok(app: &App, h: &HeaderMap) -> bool {
+    let fetch_site = h.get("sec-fetch-site").and_then(|v| v.to_str().ok());
     match h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        // Browsers send `Origin: null` for privacy-sensitive contexts (e.g. a no-referrer
+        // policy); then only an explicit same-origin Sec-Fetch-Site is accepted.
+        Some("null") => fetch_site == Some("same-origin"),
         Some(o) => o == app.cfg.public_url.trim_end_matches('/'),
         // Some clients omit Origin on same-origin POSTs; fall back to Sec-Fetch-Site.
-        None => !matches!(
-            h.get("sec-fetch-site").and_then(|v| v.to_str().ok()),
-            Some("cross-site") | Some("same-site")
-        ),
+        None => !matches!(fetch_site, Some("cross-site") | Some("same-site")),
     }
 }
 
