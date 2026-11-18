@@ -413,7 +413,8 @@ pub fn ago(now: u64, then: u64) -> String {
     }
     let d = now.saturating_sub(then);
     match d {
-        0..=59 => format!("{d}s ago"),
+        0..=4 => "just now".into(),
+        5..=59 => format!("{d}s ago"),
         60..=3599 => format!("{}m ago", d / 60),
         3600..=86_399 => format!("{}h ago", d / 3600),
         _ => format!("{}d ago", d / 86_400),

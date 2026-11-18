@@ -367,6 +367,17 @@ button.danger-solid:hover{background:color-mix(in srgb,var(--bad) 85%,#000)}
   .tbl.stack td:first-child,.tbl.stack td[colspan]{flex-basis:100%;min-width:0}
   .tbl.stack td.mono{word-break:normal;overflow-wrap:anywhere;color:var(--txt)}
   .tbl.stack td.r{margin-left:auto}
+  /* audit: "#11 · time · who · ip · event" wrap together, detail on its own line, hash last */
+  .tbl.stack.audit td:first-child{flex-basis:auto}
+  .tbl.stack.audit td:first-child::before{content:"#"}
+  .tbl.stack.audit td:nth-child(6){flex-basis:100%;color:var(--txt)}
+  .tbl.stack.audit td:nth-child(7){font-size:11.5px;color:var(--mut)}
+  .tbl.stack.audit td[colspan]{flex-basis:100%}
+  /* sessions: label the bare values once headers are hidden */
+  .tbl.stack.sess td:nth-child(4)::before{content:"Device ";color:var(--mut)}
+  .tbl.stack.sess td:nth-child(5)::before{content:"Started ";color:var(--mut)}
+  .tbl.stack.sess td:nth-child(6)::before{content:"Seen ";color:var(--mut)}
+  .tbl.stack.sess td:nth-child(7)::before{content:"Expires ";color:var(--mut)}
 }
 @media (max-width:860px){
   .shell{grid-template-columns:minmax(0,1fr);grid-template-rows:auto 1fr}

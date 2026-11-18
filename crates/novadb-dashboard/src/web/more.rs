@@ -7,6 +7,17 @@ use crate::store::AuditEntry;
 
 const PAGE: usize = 50;
 
+/// Styled 404 for unknown paths. Static: no session lookup, so it costs nothing to probe.
+pub(super) async fn not_found() -> Response {
+    let body = r#"<h1>Page not found</h1><p class="sub">That address does not exist on this dashboard.</p>
+<div class="row"><a class="btn" href="/">Go to the dashboard</a></div>"#;
+    (
+        StatusCode::NOT_FOUND,
+        Html(html::page("Not found", None, Flash::None, body)),
+    )
+        .into_response()
+}
+
 // ----- small helpers -----------------------------------------------------------------------
 
 /// Percent-encode a query-string value.
@@ -210,7 +221,7 @@ pub(super) async fn audit_page(
 <select name="who" aria-label="User">{who_opts}</select>
 <button class="sm">Apply</button>{clear}</form>
 <div class="card"><div class="card-h">{ic}{chain_html}</div>
-<div class="tbl"><table><thead><tr><th>#</th><th>Time (UTC)</th><th>Who</th><th>IP</th><th>Event</th><th>Detail</th><th>Hash</th></tr></thead><tbody>{trs}</tbody></table></div>
+<div class="tbl stack audit"><table><thead><tr><th>#</th><th>Time (UTC)</th><th>Who</th><th>IP</th><th>Event</th><th>Detail</th><th>Hash</th></tr></thead><tbody>{trs}</tbody></table></div>
 <div class="card-f between"><span>{shown}</span>{pager}</div></div>"#,
         head = html::header(
             "Audit log",
@@ -363,7 +374,7 @@ async fn sessions_render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
 <div class="kpi"><div class="kpi-h"><span>Half signed in</span><span class="ic">{ilock}</span></div><b>{half}</b><small>waiting for 2FA or setup</small></div>
 <div class="kpi"><div class="kpi-h"><span>Idle timeout</span><span class="ic">{iclock}</span></div><b>{idle}m</b><small>{abs}h absolute limit</small></div></div>
 <div class="card"><div class="card-h">{imon}<h2>All sessions</h2><span class="r hint">newest activity first</span></div>
-<div class="tbl"><table><thead><tr><th>User</th><th>State</th><th>IP</th><th>Device</th><th>Started</th><th>Last seen</th><th>Expires in</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+<div class="tbl stack sess"><table><thead><tr><th>User</th><th>State</th><th>IP</th><th>Device</th><th>Started</th><th>Last seen</th><th>Expires in</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 <div class="card-f between"><span>Revoking a session signs that device out immediately.</span>
 <form method="post" action="/sessions/revoke_all">{csrf}<button class="danger sm"{dis}>Sign out everyone else ({others})</button></form></div></div>"#,
         head = html::header(
