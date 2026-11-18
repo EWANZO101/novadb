@@ -165,7 +165,7 @@ tbody tr:hover td{background:color-mix(in srgb,var(--hover) 55%,transparent)}
 th:first-child,td:first-child{padding-left:20px}th:last-child,td:last-child{padding-right:20px}
 td.mono{word-break:break-all;color:var(--txt2)}
 td.num{font-variant-numeric:tabular-nums;color:var(--mut)}
-td.nw{white-space:nowrap}
+td.nw{white-space:nowrap}td.mono.nw{word-break:normal}
 td.r,th.r{text-align:right}
 /* tables with row action menus: let the pop-up escape the card instead of being clipped */
 .card.menus,.card.menus .tbl{overflow:visible}
@@ -364,7 +364,8 @@ button.danger-solid:hover{background:color-mix(in srgb,var(--bad) 85%,#000)}
   .tbl.stack tr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:14px 16px;border-bottom:1px solid var(--line)}
   .tbl.stack tr:last-child{border-bottom:0}
   .tbl.stack td{display:block;padding:0;border:0;background:none!important}
-  .tbl.stack td.mono,.tbl.stack td[colspan]{flex-basis:100%;word-break:normal;overflow-wrap:anywhere;color:var(--txt)}
+  .tbl.stack td:first-child,.tbl.stack td[colspan]{flex-basis:100%;min-width:0}
+  .tbl.stack td.mono{word-break:normal;overflow-wrap:anywhere;color:var(--txt)}
   .tbl.stack td.r{margin-left:auto}
 }
 @media (max-width:860px){

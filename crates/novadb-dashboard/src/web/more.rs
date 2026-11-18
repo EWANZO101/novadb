@@ -145,7 +145,7 @@ pub(super) async fn audit_page(
         .take(PAGE)
         .map(|e| {
             format!(
-                r#"<tr><td class="num">{}</td><td class="mono nw">{}</td><td><b>{}</b></td><td class="mono">{}</td><td><span class="pill {}">{}</span></td><td>{}</td><td class="mono" title="{}">{}</td></tr>"#,
+                r#"<tr><td class="num">{}</td><td class="mono nw">{}</td><td><b>{}</b></td><td class="mono nw">{}</td><td><span class="pill {}">{}</span></td><td>{}</td><td class="mono nw" title="{}">{}</td></tr>"#,
                 e.seq,
                 html::ts(e.ts),
                 esc(&e.actor),
@@ -343,7 +343,7 @@ async fn sessions_render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
                 )
             };
             format!(
-                r#"<tr><td><span class="ucell">{}<b>{}</b></span></td><td>{stage}</td><td class="mono">{}</td><td>{}</td><td class="nw">{}</td><td class="nw">{}</td><td class="nw num">{}m</td><td class="r">{action}</td></tr>"#,
+                r#"<tr><td><span class="ucell">{}<b>{}</b></span></td><td>{stage}</td><td class="mono nw">{}</td><td>{}</td><td class="nw">{}</td><td class="nw">{}</td><td class="nw num">{}m</td><td class="r">{action}</td></tr>"#,
                 html::avatar(&s.user),
                 esc(&s.user),
                 esc(&s.ip),

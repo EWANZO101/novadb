@@ -147,14 +147,17 @@ pub fn icon(name: &str) -> String {
 }
 
 /// Brand mark (gradient star over a stacked-disk silhouette). Presentation attributes only (CSP-safe).
-pub fn logo() -> &'static str {
-    r##"<svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="ng" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b7cff"/><stop offset="1" stop-color="#d06cff"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="url(#ng)"/><path d="M16 6.5c.6 4.6 2.9 6.9 7.5 7.5-4.6.6-6.9 2.9-7.5 7.5-.6-4.6-2.9-6.9-7.5-7.5 4.6-.6 6.9-2.9 7.5-7.5z" fill="#fff"/><path d="M9 23.5c2 1.3 4.4 2 7 2s5-.7 7-2" stroke="#fff" stroke-opacity=".7" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>"##
+pub fn logo(gid: &str) -> String {
+    format!(
+        r##"<svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="{gid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b7cff"/><stop offset="1" stop-color="#d06cff"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="url(#{gid})"/><path d="M16 6.5c.6 4.6 2.9 6.9 7.5 7.5-4.6.6-6.9 2.9-7.5 7.5-.6-4.6-2.9-6.9-7.5-7.5 4.6-.6 6.9-2.9 7.5-7.5z" fill="#fff"/><path d="M9 23.5c2 1.3 4.4 2 7 2s5-.7 7-2" stroke="#fff" stroke-opacity=".7" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>"##
+    )
 }
 
-fn brand() -> String {
+/// `gid` must be unique per page: two logos sharing one gradient id render blank when the first is hidden.
+fn brand(gid: &str) -> String {
     format!(
         r#"<a class="brand" href="/">{}<span class="brand-t"><b>NovaDB</b><small>Control plane</small></span></a>"#,
-        logo()
+        logo(gid)
     )
 }
 
@@ -205,13 +208,14 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
     let ver = env!("CARGO_PKG_VERSION");
     let inner = match nav {
         None => format!(
-            r#"<div class="auth"><aside class="auth-art">{brand}
+            r#"<div class="auth"><aside class="auth-art">{brand_art}
 <div><h2>The database you can see all the way through.</h2>
 <p>Self-hosted control plane for NovaDB: identity, sessions and a tamper-evident audit trail stored in NovaDB's own storage engine.</p>
 <ul class="feats"><li>{i1}Mandatory two-factor on every account</li><li>{i2}Hash-chained, append-only audit log</li><li>{i3}Crash-safe WAL storage with full verify</li></ul></div>
 <small class="legal">NovaDB v{ver} · restricted system · all access is logged</small></aside>
 <div class="auth-main"><div class="auth-box">{brand}{flash_html}{body}<p class="authfoot">Protected by Argon2id + TOTP · all sign-ins are audited</p></div></div></div>"#,
-            brand = brand(),
+            brand_art = brand("ng-a"),
+            brand = brand("ng-b"),
             i1 = icon("lock"),
             i2 = icon("audit"),
             i3 = icon("database"),
@@ -257,7 +261,7 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
             format!(
                 r#"<div class="shell"><aside class="side">{brand}
 <nav class="nav" aria-label="Main"><div class="nav-label">Control</div>{items}
-<div class="nav-label">Engine</div>{dbl}{bkl}<span class="dis">{icl}Cluster<span class="soon">Stage 8</span></span>
+<div class="nav-label">Engine</div>{dbl}{bkl}<span class="dis">{icl}Cluster<span class="soon">Soon</span></span>
 <div class="nav-label">You</div><a href="/account"{acc_cls}>{iac}Account</a></nav>
 <div class="side-foot"><div class="me">{av}<span class="me-t"><b>{user}</b><small>{role}</small></span>
 <form method="post" action="/logout">{csrf}<button class="iconbtn" title="Sign out" aria-label="Sign out">{ilo}</button></form></div>
@@ -266,7 +270,7 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
 <div class="top-r"><span class="badge ok"><span class="pulse"></span>Online</span></div></header>
 <main>{flash_html}{body}</main>
 <footer class="foot"><span>NovaDB control dashboard v{ver}</span><span>Times shown in UTC</span></footer></div></div>"#,
-                brand = brand(),
+                brand = brand("ng"),
                 dbl = if n.role >= Role::Operator {
                     format!(
                         r#"<a href="/databases"{}>{}Databases</a>"#,
