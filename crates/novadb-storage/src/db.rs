@@ -199,6 +199,15 @@ pub struct Db {
     /// Dropped trees may still hold pages.
     purge_pending: bool,
     purging: bool,
+    /// Open outer transaction (see [`Db::begin_outer`]).
+    outer: Option<Outer>,
+}
+
+/// Pages changed by an outer transaction; nothing reaches the WAL until it commits.
+struct Outer {
+    before: HashMap<PageId, Option<(PageBuf, bool)>>,
+    meta_before: Meta,
+    dropped: bool,
 }
 
 fn new_salt(avoid: u32) -> u32 {
@@ -379,6 +388,7 @@ impl Db {
             tree_id_floor: meta.next_tree_id,
             purge_error: None,
             purge_pending: true,
+            outer: None,
             purging: false,
         })
         .map(|mut db| {
@@ -419,7 +429,7 @@ impl Db {
 
     fn purge_dropped(&mut self) {
         // `purging`: the reclamation steps commit too; don't recurse from those commits.
-        if self.purge_pending && !self.purging && self.poisoned.is_none() {
+        if self.purge_pending && !self.purging && self.poisoned.is_none() && self.outer.is_none() {
             let _ = self.reclaim_dropped(PURGE_STEPS_PER_CALL);
         }
     }
@@ -484,9 +494,66 @@ impl Db {
         f(&mut tx)
     }
 
+    /// Start an outer transaction: every following [`Tx`] nests inside it. A nested commit only
+    /// makes its changes part of the outer transaction (no WAL write, pages stay pinned); a
+    /// nested rollback undoes just that nested transaction. [`Db::commit_outer`] makes it all
+    /// durable at once, [`Db::rollback_outer`] (or a crash) discards it all. Checkpoints are
+    /// refused while it is open.
+    pub fn begin_outer(&mut self) -> Result<()> {
+        self.ensure_ok()?;
+        if self.outer.is_some() {
+            return Err(Error::InvalidArgument(
+                "an outer transaction is already open".into(),
+            ));
+        }
+        self.outer = Some(Outer {
+            before: HashMap::new(),
+            meta_before: self.meta,
+            dropped: false,
+        });
+        Ok(())
+    }
+
+    /// Is an outer transaction open?
+    pub fn in_outer(&self) -> bool {
+        self.outer.is_some()
+    }
+
+    fn take_outer(&mut self) -> Result<Tx<'_>> {
+        let o = self
+            .outer
+            .take()
+            .ok_or_else(|| Error::InvalidArgument("no outer transaction is open".into()))?;
+        Ok(Tx {
+            db: self,
+            before: o.before,
+            meta_before: o.meta_before,
+            failed: false,
+            done: false,
+            dropped: o.dropped,
+        })
+    }
+
+    /// Commit the outer transaction (one WAL commit, fsync).
+    pub fn commit_outer(&mut self) -> Result<()> {
+        self.take_outer()?.commit()
+    }
+
+    /// Discard everything the outer transaction did.
+    pub fn rollback_outer(&mut self) {
+        if let Ok(tx) = self.take_outer() {
+            tx.rollback();
+        }
+    }
+
     /// Flush all dirty pages, fsync the data file and start a new (empty) WAL generation.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.ensure_ok()?;
+        if self.outer.is_some() {
+            return Err(Error::InvalidArgument(
+                "checkpoint refused: an outer transaction is open".into(),
+            ));
+        }
         let r = self.checkpoint_inner();
         if let Err(e) = &r {
             self.poison(e);
@@ -511,8 +578,9 @@ impl Db {
         Ok(())
     }
 
-    /// Checkpoint and close.
+    /// Checkpoint and close (an open outer transaction is rolled back).
     pub fn close(mut self) -> Result<()> {
+        self.rollback_outer();
         self.checkpoint()
     }
 
@@ -590,7 +658,8 @@ impl<'a> Tx<'a> {
     // ----- page access ------------------------------------------------------------------
 
     fn pin_limit(&self) -> usize {
-        self.db.pool.capacity() - POOL_RESERVE
+        let outer = self.db.outer.as_ref().map_or(0, |o| o.before.len());
+        (self.db.pool.capacity() - POOL_RESERVE).saturating_sub(outer)
     }
 
     fn check_id(&self, id: PageId) -> Result<()> {
@@ -1045,6 +1114,10 @@ impl<'a> Tx<'a> {
             return Err(e);
         }
         self.done = true;
+        if self.db.outer.is_some() {
+            self.merge_into_outer();
+            return Ok(());
+        }
         if self.before.is_empty() {
             return Ok(());
         }
@@ -1130,9 +1203,30 @@ impl<'a> Tx<'a> {
         self.rollback_inner();
     }
 
+    /// Nested commit: hand the changes to the outer transaction (pages stay pinned).
+    fn merge_into_outer(&mut self) {
+        let dropped = self.dropped;
+        let before = std::mem::take(&mut self.before);
+        if let Some(o) = self.db.outer.as_mut() {
+            o.dropped |= dropped;
+            for (id, b) in before {
+                o.before.entry(id).or_insert(b);
+            }
+        }
+    }
+
     fn rollback_inner(&mut self) {
         for (id, b) in self.before.drain() {
             self.db.pool.restore(id, b);
+            // Still changed by the outer transaction: keep it pinned (no-steal).
+            if self
+                .db
+                .outer
+                .as_ref()
+                .is_some_and(|o| o.before.contains_key(&id))
+            {
+                self.db.pool.pin(id);
+            }
         }
         self.db.meta = self.meta_before;
         self.done = true;

@@ -53,6 +53,14 @@ the WAL header carries the database id, so stale or foreign records are never re
 after recovery): flush dirty pages → fsync data file → write new WAL header to a temp file →
 fsync → atomic rename → fsync directory.
 
+**Outer transaction** (`Db::begin_outer` / `commit_outer` / `rollback_outer`, used for
+transactional DDL): every `Tx` started while it is open nests inside it. A nested commit moves
+its page before-images into the outer transaction (first image wins) without touching the WAL —
+pages stay pinned; a nested rollback restores only its own pages (re-pinning those the outer one
+still owns). `commit_outer` is one normal commit of all pages; `rollback_outer` and a crash leave
+no trace. Checkpoints are refused and dropped-tree reclamation waits while it is open; its pages
+count against the transaction size limit.
+
 **fsync failure** (PLAN §4.12): the handle is poisoned; every later call returns
 `Error::Poisoned`. The data is never "retried" because Linux may have dropped the dirty pages.
 Reopen = crash recovery from the WAL.

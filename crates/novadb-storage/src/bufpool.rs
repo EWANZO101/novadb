@@ -160,6 +160,13 @@ impl BufferPool {
     }
 
     /// Unpin after commit (contents now durable in the WAL).
+    /// Keep a resident frame in memory (it holds uncommitted changes).
+    pub fn pin(&mut self, id: PageId) {
+        if let Some(&i) = self.map.get(&id) {
+            self.frames[i].pinned = true;
+        }
+    }
+
     pub fn unpin(&mut self, id: PageId) {
         if let Some(&i) = self.map.get(&id) {
             self.frames[i].pinned = false;

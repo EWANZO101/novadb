@@ -22,7 +22,7 @@ Requested by the owner on 2026-11-18; keep this list current as stages land.
 |---|---|---|
 | Lenient defaults (silent truncation, zero dates, fallback values) | Strict mode only, cannot be turned off: too long → 1406, out of range → 1264, bad value → 1366, zero dates rejected, NOT NULL without default → 1364. | ✅ |
 | `utf8` = 3 bytes, broken emoji | Only utf8mb4; invalid UTF-8 rejected at the lexer and protocol layer. | ✅ |
-| Implicit commit on DDL / no transactional DDL | Currently DDL commits like MySQL (and is refused while others have open transactions). **Next:** transactional DDL — `CREATE/DROP/ALTER` inside `BEGIN … ROLLBACK`, migrations that fail roll back completely. | 🟡 next |
+| Implicit commit on DDL / no transactional DDL | **Transactional DDL**: `CREATE/DROP TABLE/INDEX` inside `BEGIN` (or with `autocommit = 0`) join the transaction — `ROLLBACK`, a disconnect or a crash undo the schema change *and* the data changes around it; a failing statement undoes only itself. A half-run migration can't leave a half-changed schema. Binlog gets it only on COMMIT. While such a transaction is open, other sessions get 1205 (retry). User/GRANT statements still commit implicitly. See [transactions.md](transactions.md#transactional-ddl). | ✅ |
 | Storage-engine fragmentation (MyISAM vs InnoDB) | One engine; every table is transactional and crash-safe. | ✅ |
 | Painful schema changes on big tables (`gh-ost`, `pt-osc`) | **Planned:** online `ALTER TABLE` (add/drop column, add index) built on MVCC — readers and writers keep working; index builds from a snapshot. | 🟡 planned |
 | Concurrency / locking bottlenecks | MVCC snapshot isolation: readers never block, no row locks, no deadlocks, conflicts → 1213 retry. | ✅ |

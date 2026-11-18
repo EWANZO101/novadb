@@ -112,6 +112,34 @@ pub struct Engine {
     binlog: Option<Binlog>,
     /// Enforce GRANTs (server); embedded use is trusted.
     enforce: bool,
+    /// Connection running a transaction that contains DDL (storage outer transaction).
+    ddl_owner: Option<u32>,
+    /// Binlog records held back until that transaction commits.
+    deferred: Option<Vec<Record>>,
+}
+
+/// Append to the binlog, or hold the record back while a transactional-DDL transaction is open.
+fn log_rec(
+    binlog: &mut Option<Binlog>,
+    deferred: &mut Option<Vec<Record>>,
+    r: Record,
+) -> Result<()> {
+    match (binlog.as_mut(), deferred.as_mut()) {
+        (Some(_), Some(d)) => {
+            d.push(r);
+            Ok(())
+        }
+        (Some(b), None) => b.append(&r),
+        (None, _) => Ok(()),
+    }
+}
+
+fn ddl_busy() -> SqlError {
+    let mut e = SqlError::internal(
+        "Lock wait timeout exceeded; another session has an open transaction that changes the schema (retry after it commits or rolls back)",
+    );
+    e.code = 1205;
+    e
 }
 
 fn system_now() -> i64 {
@@ -133,6 +161,8 @@ impl Engine {
             pending: HashSet::new(),
             binlog: None,
             enforce: false,
+            ddl_owner: None,
+            deferred: None,
         })
     }
     pub fn open_vfs(vfs: Box<dyn Vfs>, opts: Options) -> Result<Engine> {
@@ -146,6 +176,8 @@ impl Engine {
             pending: HashSet::new(),
             binlog: None,
             enforce: false,
+            ddl_owner: None,
+            deferred: None,
         })
     }
     /// Replace the clock used by NOW()/CURRENT_TIMESTAMP (tests).
@@ -217,6 +249,9 @@ impl Engine {
 
     /// Store an already-hashed password (bootstrap / ALTER USER).
     pub fn set_user_hash(&mut self, user: &str, hash: &str) -> Result<()> {
+        if self.ddl_owner.is_some() {
+            return Err(ddl_busy());
+        }
         let k = user.to_lowercase();
         self.db.update(|tx| {
             let t = tx.open_or_create_tree(USERS_TREE)?;
@@ -312,6 +347,9 @@ impl Engine {
                 }
             }
         }
+        if self.ddl_owner.is_some_and(|o| o != conn) {
+            return Err(ddl_busy());
+        }
         if self.enforce {
             let user = sess.user.clone();
             self.authorize(s, &user)?;
@@ -330,6 +368,7 @@ impl Engine {
             Stmt::Txn(TxnKind::Commit) => self.commit_txn(conn).map(|_| QueryResult::ok(0)),
             Stmt::Txn(TxnKind::Rollback) => {
                 self.txns.remove(&conn);
+                self.rollback_ddl(conn);
                 Ok(QueryResult::ok(0))
             }
             Stmt::Set(assignments) if assignments.iter().any(|(n, _)| n == "autocommit") => {
@@ -397,14 +436,34 @@ impl Engine {
             | Stmt::DropTable { .. }
             | Stmt::CreateIndex { .. }
             | Stmt::DropIndex { .. } => {
-                // DDL implicitly commits (like MySQL) and needs the tables to itself.
-                self.commit_txn(conn)?;
+                // Inside a transaction (BEGIN or autocommit=0) DDL is transactional: it joins
+                // the transaction and ROLLBACK undoes it. Outside one it is its own transaction.
+                // Either way it needs the tables to itself.
+                let transactional = self.ddl_owner == Some(conn)
+                    || self.txns.contains_key(&conn)
+                    || self.manual.contains(&conn);
                 if self.txns.keys().any(|c| *c != conn) {
                     let mut e = SqlError::internal(
                         "Lock wait timeout exceeded; another session has an open transaction (DDL waits for it to COMMIT or ROLLBACK)",
                     );
                     e.code = 1205;
                     Err(e)
+                } else if transactional {
+                    if self.ddl_owner.is_none() {
+                        self.db.begin_outer()?;
+                        self.deferred = Some(Vec::new());
+                        // The transaction's earlier changes become part of the outer one.
+                        if let Err(e) = self.commit_txn(conn) {
+                            self.db.rollback_outer();
+                            self.deferred = None;
+                            return Err(e);
+                        }
+                        self.ddl_owner = Some(conn);
+                    }
+                    self.pending.clear();
+                    let r = self.exec_stmt(s, conn)?;
+                    self.log_after(s)?;
+                    Ok(r)
                 } else {
                     // Old versions in dropped trees are gone; forget them.
                     self.pending.clear();
@@ -429,12 +488,13 @@ impl Engine {
     /// Forget a connection (rolls back its open transaction).
     pub fn end_session(&mut self, conn_id: u32) {
         self.txns.remove(&conn_id);
+        self.rollback_ddl(conn_id);
         self.manual.remove(&conn_id);
     }
 
     /// MySQL server status bits for a connection: IN_TRANS (1) and AUTOCOMMIT (2).
     pub fn status(&self, conn_id: u32) -> u16 {
-        u16::from(self.txns.contains_key(&conn_id))
+        u16::from(self.txns.contains_key(&conn_id) || self.ddl_owner == Some(conn_id))
             | if self.manual.contains(&conn_id) { 0 } else { 2 }
     }
 
@@ -458,7 +518,39 @@ impl Engine {
         Ok(())
     }
 
+    /// Discard a transactional-DDL transaction owned by `conn`.
+    fn rollback_ddl(&mut self, conn: u32) {
+        if self.ddl_owner == Some(conn) {
+            self.db.rollback_outer();
+            self.ddl_owner = None;
+            self.deferred = None;
+            self.pending.clear();
+        }
+    }
+
+    /// Commit the open transactional-DDL transaction (binlog first, then one storage commit).
+    fn commit_ddl(&mut self) -> Result<()> {
+        self.ddl_owner = None;
+        let recs = self.deferred.take().unwrap_or_default();
+        let r = (|| {
+            if let Some(b) = self.binlog.as_mut() {
+                for rec in &recs {
+                    b.append(rec)?;
+                }
+            }
+            Ok(self.db.commit_outer()?)
+        })();
+        if r.is_err() {
+            self.db.rollback_outer();
+        }
+        r
+    }
+
     fn commit_txn(&mut self, conn: u32) -> Result<()> {
+        if self.ddl_owner == Some(conn) {
+            self.txns.remove(&conn);
+            return self.commit_ddl();
+        }
         let Some(txn) = self.txns.remove(&conn) else {
             return Ok(());
         };
@@ -472,13 +564,15 @@ impl Engine {
             let cat = catalog(&mut tx)?;
             let ts = mvcc::commit(&mut tx, &cat, &txn.ws, txn.snap, &snaps, &mut self.pending)?;
             gc_pending(&mut tx, &snaps, &mut self.pending)?;
-            if let Some(b) = self.binlog.as_mut() {
-                b.append(&Record {
+            log_rec(
+                &mut self.binlog,
+                &mut self.deferred,
+                Record {
                     ts,
                     wall_us: now,
                     ops: txn.ws.log.clone(),
-                })?;
-            }
+                },
+            )?;
             Ok(())
         })();
         match r {
@@ -498,7 +592,10 @@ impl Engine {
             s,
             Stmt::Select(_) | Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. }
         );
-        let in_txn = self.txns.contains_key(&conn) || (self.manual.contains(&conn) && starts_txn);
+        // In a transactional-DDL transaction each statement commits into the storage outer
+        // transaction (no other session can run meanwhile), so no MVCC write set is kept.
+        let in_txn = self.ddl_owner != Some(conn)
+            && (self.txns.contains_key(&conn) || (self.manual.contains(&conn) && starts_txn));
         let mut tx = self.db.begin()?;
         let cat = match catalog(&mut tx) {
             Ok(c) => c,
@@ -563,13 +660,15 @@ impl Engine {
                 if !ws.is_empty() {
                     let ts = mvcc::commit(&mut tx, &cat, &ws, snap, &snaps, &mut self.pending)?;
                     gc_pending(&mut tx, &snaps, &mut self.pending)?;
-                    if let Some(b) = self.binlog.as_mut() {
-                        b.append(&Record {
+                    log_rec(
+                        &mut self.binlog,
+                        &mut self.deferred,
+                        Record {
                             ts,
                             wall_us: now,
                             ops: std::mem::take(&mut ws.log),
-                        })?;
-                    }
+                        },
+                    )?;
                 }
                 Ok(r)
             })();
@@ -2932,13 +3031,15 @@ impl Engine {
             let cat = catalog(&mut tx)?;
             let ts = mvcc::last_ts(&mut tx, &cat)? + 1;
             tx.put(&cat, mvcc::TS_KEY, &ts.to_le_bytes())?;
-            if let Some(b) = self.binlog.as_mut() {
-                b.append(&Record {
+            log_rec(
+                &mut self.binlog,
+                &mut self.deferred,
+                Record {
                     ts,
                     wall_us: wall,
                     ops,
-                })?;
-            }
+                },
+            )?;
             Ok(())
         })();
         match r {
@@ -3021,6 +3122,9 @@ impl Engine {
     /// Begin a consistent dump: registers a snapshot for `conn` (old versions it needs are kept
     /// until `end_session`). Returns the snapshot timestamp.
     pub fn dump_begin(&mut self, conn: u32) -> Result<u64> {
+        if self.ddl_owner.is_some() {
+            return Err(ddl_busy());
+        }
         self.commit_txn(conn)?;
         self.begin_txn(conn)?;
         Ok(self.txns.get(&conn).map_or(0, |t| t.snap))
@@ -3097,6 +3201,9 @@ impl Engine {
 
     /// Set a table's AUTO_INCREMENT (or hidden row-id) counter to at least `value`.
     pub fn set_counter(&mut self, table: &str, rowid: bool, value: u64) -> Result<()> {
+        if self.ddl_owner.is_some() {
+            return Err(ddl_busy());
+        }
         let mut tx = self.db.begin()?;
         let r = (|| {
             let t = load_table(&mut tx, table)?;
@@ -3123,6 +3230,9 @@ impl Engine {
     /// Apply one binary-log record (point-in-time recovery). Row changes of a record are
     /// applied atomically; constraints were checked when the change was first made.
     pub fn apply_record(&mut self, rec: &Record) -> Result<()> {
+        if self.ddl_owner.is_some() {
+            return Err(ddl_busy());
+        }
         let mut rows: Vec<&LogOp> = Vec::new();
         for op in &rec.ops {
             match op {
@@ -3291,6 +3401,9 @@ impl Engine {
 
     /// Set a grant directly (restore).
     pub fn set_grant(&mut self, user: &str, scope: &str, mask: u64) -> Result<()> {
+        if self.ddl_owner.is_some() {
+            return Err(ddl_busy());
+        }
         privs::set(
             &mut self.db,
             user,

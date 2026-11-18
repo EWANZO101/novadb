@@ -36,9 +36,39 @@ Module: `crates/novadb-sql/src/mvcc.rs`, transaction manager in `exec.rs` (`Engi
   re-pruned after later commits.
 * AUTO_INCREMENT values are handed out immediately and never reused, even if the transaction
   rolls back (same as InnoDB).
-* DDL (`CREATE/DROP TABLE/INDEX`, user statements) implicitly commits the session's transaction.
+* DDL (`CREATE/DROP TABLE/INDEX`) inside a transaction is **transactional** (next section).
+  Outside a transaction it is its own transaction. User statements (`CREATE/ALTER/DROP USER`,
+  `GRANT`, `REVOKE`) implicitly commit the session's transaction, like MySQL.
   While **another** session has an open transaction, DDL fails with `ERROR 1205 Lock wait timeout
   exceeded` instead of pulling tables out from under it — retry after it commits.
+
+## Transactional DDL
+```sql
+BEGIN;
+CREATE TABLE orders (id INT PRIMARY KEY AUTO_INCREMENT, acct INT, total INT);
+CREATE INDEX ix_acct ON orders (acct);
+INSERT INTO orders (acct, total) SELECT id, 0 FROM acct;
+DROP TABLE old_orders;
+COMMIT;          -- or ROLLBACK: everything above, schema and data, is undone
+```
+* Works after `BEGIN`/`START TRANSACTION` and with `autocommit = 0`. Changes made earlier in the
+  same transaction become part of it.
+* `ROLLBACK`, disconnecting, `KILL` and a crash discard all of it; `COMMIT` makes all of it durable
+  with one WAL commit. A failing statement undoes only itself and the transaction continues.
+* `BEGIN` and `SET autocommit = 1` commit it (like any transaction); user/GRANT statements too.
+* The binlog receives the transaction's records only at `COMMIT`, so point-in-time recovery never
+  replays a rolled-back migration.
+* **Exclusive while open**: the first DDL statement waits for no one — it needs every other
+  session to be outside a transaction (else 1205) — and from then until COMMIT/ROLLBACK every
+  other session's statements get `ERROR 1205` (retry). Keep migration transactions short.
+* Size: all pages it changes stay in the buffer pool until COMMIT, so a very large migration (e.g.
+  an index over a big table) fails with `ERROR 1038 out of memory` (the transaction stays open; roll
+  back). Run such statements outside a transaction, or raise the cache size.
+* How: the storage engine has an *outer transaction* (`Db::begin_outer`): statement-level storage
+  transactions nest inside it — a nested commit only hands its page before-images to the outer
+  one (no WAL write, pages stay pinned = no-steal), a nested rollback restores just its own pages.
+  `commit_outer` writes all changed pages to the WAL in one commit; checkpoints are refused while
+  it is open, so nothing uncommitted can reach the data file.
 
 ## Not (yet) provided
 * SERIALIZABLE: snapshot isolation allows *write skew* (two transactions each read what the other
@@ -51,9 +81,15 @@ Module: `crates/novadb-sql/src/mvcc.rs`, transaction manager in `exec.rs` (`Engi
   transaction timeout yet (connections themselves close after 8 h idle).
 
 ## Tests
+* `tests/ddl_txn.rs`: rollback of CREATE/DROP TABLE/INDEX together with data; atomic + durable
+  commit (survives a crash right after); failing statements inside; crash mid-migration leaves
+  nothing; other sessions get 1205 and disconnect rolls back; autocommit=0 and implicit commits;
+  binlog has only committed changes and replaying it reproduces the database.
+* `novadb-storage/tests/db.rs` `outer_txn_*`: nested commit/rollback, dropped/new trees, crash with
+  an open outer transaction, no checkpoint while open, overflowing the cache fails cleanly.
 * `tests/txn.rs`: commit/rollback + durability across reopen; dirty/non-repeatable/phantom reads
   prevented (also via indexes); read-your-own-writes through unique and secondary indexes;
-  statement-level undo; lost update and concurrent unique inserts → 1213; DDL implicit commit and
+  statement-level undo; lost update and concurrent unique inserts → 1213; DDL inside transactions and
   1205; autocommit=0; disconnect rollback; version pruning with and without open snapshots.
 * **Randomised snapshot-isolation checker**: 4 sessions, 12,000 interleaved steps of random
   reads (full scan, point, index), inserts, updates, deletes, commits and rollbacks, checked

@@ -727,3 +727,106 @@ fn reclaiming_a_corrupt_dropped_tree_errors_instead_of_hanging() {
     drop(db);
     let _db = open(&v, 64); // reopen must not hang either
 }
+
+fn put_n(db: &mut Db, tree: &str, from: u64, n: u64) -> Result<(), Error> {
+    db.update(|tx| {
+        let t = match tx.open_tree(tree) {
+            Ok(t) => t,
+            Err(Error::TreeNotFound(_)) => tx.create_tree(tree)?,
+            Err(e) => return Err(e),
+        };
+        for i in from..from + n {
+            tx.put(&t, &key(i), &[3u8; 150])?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn outer_txn_commit_rollback_and_crash() {
+    let v = SimVfs::new();
+    let mut db = open(&v, 512);
+    put_n(&mut db, "base", 0, 500).unwrap();
+    let start = db.stats();
+
+    // Rollback: nested commits, a nested failure, a new tree and a dropped tree all vanish.
+    db.begin_outer().unwrap();
+    assert!(db.begin_outer().is_err(), "outer transactions do not nest");
+    put_n(&mut db, "base", 500, 1000).unwrap();
+    put_n(&mut db, "new", 0, 300).unwrap();
+    {
+        // nested rollback undoes only itself
+        let mut tx = db.begin().unwrap();
+        let t = tx.open_tree("base").unwrap();
+        tx.delete(&t, &key(1)).unwrap();
+        tx.delete(&t, &key(600)).unwrap();
+    }
+    assert!(dump(&mut db, "base").contains_key(&key(600)));
+    db.update(|tx| tx.drop_tree("base")).unwrap();
+    assert!(
+        db.checkpoint().is_err(),
+        "no checkpoint while outer is open"
+    );
+    db.rollback_outer();
+    assert_eq!(dump(&mut db, "base").len(), 500);
+    assert!(db.view(|tx| tx.open_tree("new")).is_err());
+    assert_eq!(db.stats().page_count, start.page_count);
+    db.verify().unwrap();
+
+    // Commit: everything lands at once and survives a reopen without close.
+    db.begin_outer().unwrap();
+    put_n(&mut db, "base", 500, 1000).unwrap();
+    put_n(&mut db, "new", 0, 300).unwrap();
+    db.update(|tx| {
+        let t = tx.open_tree("base")?;
+        tx.delete(&t, &key(0)).map(|_| ())
+    })
+    .unwrap();
+    db.commit_outer().unwrap();
+    assert!(db.commit_outer().is_err());
+    drop(db);
+    let mut db = open(&v, 512);
+    assert_eq!(dump(&mut db, "base").len(), 1499);
+    assert_eq!(dump(&mut db, "new").len(), 300);
+    db.verify().unwrap();
+
+    // Crash with an open outer transaction: nothing of it is durable.
+    db.begin_outer().unwrap();
+    put_n(&mut db, "new", 300, 400).unwrap();
+    db.update(|tx| tx.drop_tree("base")).unwrap();
+    drop(db);
+    let mut db = open(&v, 512);
+    assert_eq!(dump(&mut db, "base").len(), 1499);
+    assert_eq!(dump(&mut db, "new").len(), 300);
+    db.verify().unwrap();
+
+    // Dropped tree in a committed outer transaction: pages are reclaimed afterwards.
+    db.begin_outer().unwrap();
+    db.update(|tx| tx.drop_tree("base")).unwrap();
+    db.commit_outer().unwrap();
+    db.verify().unwrap();
+    let s = db.stats();
+    assert!(s.free_pages > 0, "dropped tree pages reclaimed: {s:?}");
+    db.close().unwrap();
+}
+
+#[test]
+fn outer_txn_small_cache_is_too_large_not_corrupt() {
+    // Pages of an outer transaction stay pinned; overflowing the cache fails cleanly.
+    let v = SimVfs::new();
+    let mut db = open(&v, 32);
+    put_n(&mut db, "t", 0, 10).unwrap();
+    db.begin_outer().unwrap();
+    let mut failed = false;
+    for i in 0..200 {
+        if let Err(e) = put_n(&mut db, "t", 10 + i * 50, 50) {
+            assert!(matches!(e, Error::TxnTooLarge { .. }), "{e}");
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    db.rollback_outer();
+    assert_eq!(dump(&mut db, "t").len(), 10);
+    db.verify().unwrap();
+}

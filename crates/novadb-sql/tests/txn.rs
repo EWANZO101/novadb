@@ -237,10 +237,12 @@ fn first_committer_wins() {
 #[test]
 fn ddl_autocommit_mode_and_sessions() {
     let mut d = setup();
-    // DDL commits the session's own transaction.
+    // DDL inside a transaction joins it (transactional DDL); others wait until COMMIT.
     d.ok(1, "BEGIN");
     d.ok(1, "INSERT INTO acct VALUES (3, 'cat', 1)");
     d.ok(1, "CREATE TABLE side (x INT)");
+    assert_eq!(d.code(0, "SELECT id FROM acct WHERE id = 3"), 1205);
+    d.ok(1, "COMMIT");
     assert_eq!(d.col(0, "SELECT id FROM acct WHERE id = 3"), vec!["3"]);
     // ...and waits for other sessions' open transactions.
     d.ok(2, "BEGIN");
