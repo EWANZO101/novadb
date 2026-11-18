@@ -1,4 +1,4 @@
-# NovaDB SQL (Stage 3 — single node)
+# NovaDB SQL (Stages 3 + 6, single node)
 
 Crate: `crates/novadb-sql`. Everything is hand-written (PLAN.md §2): lexer, recursive-descent
 parser, value semantics, key/row encodings, catalog, planner and executor. No new dependencies
@@ -21,6 +21,7 @@ long, 1264 out of range, …) so the Stage 4 wire protocol can pass them through
 | Queries | `SELECT [DISTINCT] exprs | * | t.* FROM t [AS a] [[INNER|LEFT|RIGHT|CROSS] JOIN u [AS b] ON …|USING (…) | , u …] [WHERE] [GROUP BY …] [HAVING …] [ORDER BY expr|alias|position [ASC|DESC], …] [LIMIT n [OFFSET m] | LIMIT m, n]`, `SELECT` without `FROM` (Stage 6) |
 | Aggregates | `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX/GROUP_CONCAT([DISTINCT] …)`, `GROUP_CONCAT(… SEPARATOR '…')`; aggregates over joins; HAVING with aliases; ORDER BY aggregates |
 | Subqueries | scalar `(SELECT …)`, `[NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)` in SELECT/WHERE/HAVING/UPDATE/DELETE/INSERT; `INSERT … SELECT`. Uncorrelated only — a subquery referring to an outer column returns `ERROR 1235` |
+| Privileges | `GRANT priv[, …] ON *.* | t TO user [WITH GRANT OPTION]`, `REVOKE … ON … FROM user`, `SHOW GRANTS [FOR user]` — see [Privileges](#privileges) |
 | Control | `KILL [QUERY|CONNECTION] id`, `SHOW PROCESSLIST` (server), `SET max_execution_time = ms` (SELECT; error 3024) |
 | Introspection | `SHOW TABLES`, `DESCRIBE t` / `SHOW COLUMNS FROM t`, `SHOW CREATE TABLE t` (output re-parses), `EXPLAIN SELECT/UPDATE/DELETE` |
 | Types | `INT`, `BIGINT`, `DECIMAL(p,s)` (exact, p ≤ 38), `VARCHAR(n)`/`CHAR(n)`, `TEXT`, `BLOB` (≤ 64 KiB), `DATETIME[(fsp)]` (1000-01-01 … 9999-12-31, µs) |
@@ -62,13 +63,36 @@ running random workloads against an indexed and an unindexed copy of the same ta
 
 ## Limits / not yet (by design, later stages)
 * No correlated subqueries, UNION, window functions, CTEs, derived tables (`FROM (SELECT …)`), ALTER TABLE.
-* Multi-statement transactions: see [transactions.md](transactions.md) (Stage 5, snapshot isolation). Statements execute one at a time.
+* Transactions (`BEGIN … COMMIT/ROLLBACK`, snapshot isolation): see [transactions.md](transactions.md). DDL still commits implicitly like MySQL; transactional DDL is next ([mysql-pitfalls.md](mysql-pitfalls.md)).
 * Sorting, join results, groups and UPDATE/DELETE candidate sets are in memory, capped at
   1,000,000 rows (`MAX_ROWS_IN_MEMORY`); there is no disk spill yet.
 * Collation is binary (case-sensitive `'a' <> 'A'`); MySQL's default is case-insensitive.
 * Table and column names are case-insensitive (like `lower_case_table_names=1`).
 * FLOAT/DOUBLE, DATE/TIME/TIMESTAMP, ENUM/SET, JSON are not implemented.
-* No network server yet: the MySQL protocol on 127.0.0.1:3307 is Stage 4.
+* No roles (`CREATE ROLE`), no column-level grants. Backups / binlog / PITR: [operations.md](operations.md).
+
+## Privileges
+Least privilege by default: `CREATE USER` gives a login and **nothing else**.
+
+| scope | privileges |
+|---|---|
+| table (`ON t`) | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `INDEX`, `ALTER` |
+| global (`ON *.*`) | all of the above for every table, plus `CREATE USER`, `PROCESS`, `SUPER`; `ALL [PRIVILEGES]` |
+
+* Every table a statement touches is checked — joins, subqueries and `INSERT … SELECT` included.
+  Denied → `ERROR 1142`; missing global privilege → `1227`; global-only privilege on a table → `1144`;
+  grant to an unknown user → `1410`.
+* `SHOW TABLES` only lists tables you have some privilege on (no name leaks).
+* `WITH GRANT OPTION` lets a user pass on **only privileges they hold themselves**.
+* Users may change only their own password; `DROP USER` removes their grants.
+* `BACKUP` needs `SUPER`; `KILL` of someone else's connection needs `SUPER`; the full
+  `SHOW PROCESSLIST` needs `PROCESS`.
+* `root` always has every privilege (the server can't be locked out).
+* Enforced by the network server (`Engine::with_privileges`). An embedded engine (CLI,
+  dashboard workspace) is trusted and does not check grants.
+* Grants are stored in tree `sql:grants`, included in backups and written to the binary log
+  (replayed on restore / PITR).
+* Tests: `tests/privs.rs`.
 
 ## Tests
 * Unit tests in every module (lexer, parser incl. depth bombs, decimal/datetime maths, LIKE,

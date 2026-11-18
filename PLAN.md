@@ -1,6 +1,7 @@
 # NovaDB — Build Plan (based on Master Spec v0.2)
-Status: PLANNED ONLY. Do not start building before Monday 2026-11-16 (wait for the weekly limit reset).
-Location: /root/novadb (nothing built yet).
+Status (2026-11-18): Stages 1–7 done, Stage 9 dashboard in progress (live), privileges done; next transactional DDL,
+online `ALTER TABLE`, then Stage 8. Current state: [README.md](README.md), results: [TESTING.md](TESTING.md).
+Location: this GitHub repo only (nothing kept on the server, see §6).
 
 ## 0. Reality check
 The spec is many person-years (an engine + Raft cluster + identity provider + cloud + website).
@@ -8,10 +9,10 @@ We build it in thin vertical stages; each stage ends with something runnable and
 No "MySQL compatible" / "high availability" / "fast" claims until the matching test suites pass (spec §5, §19).
 
 ## 1. Host constraints (this VPS)
-- 4 cores / 7 GB RAM, shared with FiveM + MariaDB + panel. Rust builds and benchmarks will steal CPU from the game server.
-  -> run cargo with `nice -n 19` + `-j2`, or (better) use a separate dev VPS for builds/benchmarks.
+- 6 vCPU / 16 GB RAM (upgraded from 4 / 7 GB, 2026-11-16), shared with FiveM + MariaDB + panel. Rust builds and benchmarks will steal CPU from the game server.
+  -> all builds/tests run in the `novadb-builder` Docker image capped at 2 CPU / 3 GB with `nice -n 19` (docker/README.md).
 - Port 3306 is MariaDB's. NovaDB dev listens on 127.0.0.1:3307 only; REST on 127.0.0.1 behind nginx later.
-- Rust not installed yet -> rustup (stable), cargo-deny, cargo-audit, cargo-fuzz, cargo-nextest.
+- Rust toolchain (stable + nightly for fuzzing), cargo-deny, cargo-audit, cargo-fuzz, cargo-nextest live only inside that image.
 - Cluster testing = 3 Docker containers on one host (fine for correctness, not for perf numbers).
 
 ## 2. Key design decisions (recommended)
@@ -27,16 +28,18 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 | Licence | clean-room; do NOT copy MySQL/MariaDB (GPL) source | legal |
 
 ## 3. Stages
-**Stage 1 (Mon 16 Nov) — skeleton**: cargo workspace (engine, protocol, sql, server, cli), CI (fmt, clippy -D warnings, test, cargo-deny/audit), `#![forbid(unsafe_code)]` everywhere except storage crate.
-**Stage 2 — storage**: pager, buffer pool w/ memory cap, B+Tree, WAL, fsync, crash recovery. Crash tests (kill -9 loop + verify).
-**Stage 3 — SQL single-node**: CREATE/DROP TABLE, INSERT/SELECT/UPDATE/DELETE, WHERE, ORDER BY, LIMIT, PK + secondary index, core types (INT, BIGINT, DECIMAL, VARCHAR, TEXT, BLOB, DATETIME).
-**Stage 4 — MySQL protocol**: handshake, TLS, auth, COM_QUERY, COM_STMT_*, result sets, errors. Gate: `mysql` CLI, HeidiSQL, DBeaver, PHP PDO, Node mysql2, Python connector connect + CRUD in automated tests.
-**Stage 5 — transactions**: MVCC, BEGIN/COMMIT/ROLLBACK, deadlock detection, group commit, isolation tests.
-**Stage 6 — joins/aggregates/planner**: JOIN, GROUP BY, HAVING, subqueries, cost-based index selection, query timeout/cancel (KILL).
-**Stage 7 — ops**: Docker image, systemd unit, backup/restore + PITR, Prometheus metrics.
-**Stage 8 — replication/cluster (custom Raft)**: 3-node, leader election, log replication, join tokens, mTLS, partition tests (Jepsen-style).
-**Stage 9 — Control dashboard + Identity** (Argon2id, TOTP, passkeys, Discord/GitHub OAuth, audit log).
-**Stage 10 — REST/WebSocket + SDKs**, then website/docs.
+✅ done · 🟡 in progress · ⏳ planned. Extra work from the owner's MySQL-pitfalls list ([docs/mysql-pitfalls.md](docs/mysql-pitfalls.md)): ✅ GRANT/REVOKE privileges → transactional DDL → online `ALTER TABLE` → then Stage 8.
+
+- ✅ **Stage 1 (Mon 16 Nov) — skeleton**: cargo workspace (engine, protocol, sql, server, cli), CI (fmt, clippy -D warnings, test, cargo-deny/audit), `#![forbid(unsafe_code)]` everywhere except storage crate.
+- ✅ **Stage 2 — storage**: pager, buffer pool w/ memory cap, B+Tree, WAL, fsync, crash recovery. Crash tests (kill -9 loop + verify).
+- ✅ **Stage 3 — SQL single-node**: CREATE/DROP TABLE, INSERT/SELECT/UPDATE/DELETE, WHERE, ORDER BY, LIMIT, PK + secondary index, core types (INT, BIGINT, DECIMAL, VARCHAR, TEXT, BLOB, DATETIME).
+- ✅ **Stage 4 — MySQL protocol**: handshake, TLS, auth, COM_QUERY, COM_STMT_*, result sets, errors. Gate: `mysql` CLI, HeidiSQL, DBeaver, PHP PDO, Node mysql2, Python connector connect + CRUD in automated tests. *(Done: `mariadb` CLI + Node mysql2; PHP PDO, Python, JDBC, GUI tools still untested — docs/protocol.md.)*
+- ✅ **Stage 5 — transactions**: MVCC, BEGIN/COMMIT/ROLLBACK, deadlock detection, group commit, isolation tests. *(Snapshot isolation, first-committer-wins → 1213; no row locks so no deadlocks — docs/transactions.md.)*
+- ✅ **Stage 6 — joins/aggregates/planner**: JOIN, GROUP BY, HAVING, subqueries, cost-based index selection, query timeout/cancel (KILL). *(Done except cost-based selection: rule-based index choice + index nested-loop joins, no join reordering yet — docs/sql.md.)*
+- ✅ **Stage 7 — ops**: Docker image, systemd unit, backup/restore + PITR, Prometheus metrics.
+- ⏳ **Stage 8 — replication/cluster (custom Raft)**: 3-node, leader election, log replication, join tokens, mTLS, partition tests (Jepsen-style).
+- 🟡 **Stage 9 — Control dashboard + Identity** (Argon2id, TOTP, passkeys, Discord/GitHub OAuth, audit log). *(Live at the dashboard; passkeys not done yet — docs/dashboard.md.)*
+- ⏳ **Stage 10 — REST/WebSocket + SDKs**, then website/docs.
 **Later / separate project**: Windows installer, Kubernetes/Helm, NovaDB Cloud + billing, stored procedures, triggers, LSM engine.
 
 ## 4. Security review of the spec — issues & fixes
@@ -71,4 +74,4 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 - **Testing is always done from a fresh `git clone`** of this repo into a temp dir: build -> `cargo test` -> clippy -> cargo-audit/cargo-deny -> fuzz smoke runs -> crash/recovery tests -> security checks from §4. Delete the clone afterwards.
 - Results go in `TESTING.md` in the repo (date, commit, what passed/failed).
 - **Alert the user when all bug + security testing is complete** (push notification + chat message), with a summary of findings.
-- Build starts no earlier than Monday 2026-11-16.
+- Build started Monday 2026-11-16.

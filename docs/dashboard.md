@@ -2,9 +2,9 @@
 
 Crate: `crates/novadb-dashboard`. Server-rendered HTML, **no JavaScript**, one binary.
 
-> Built ahead of Stages 3–8 at the owner's request (2026-11-18). There is no SQL server yet, so the
-> dashboard currently manages its own identity system and shows engine/system-DB health. Database,
-> cluster and backup screens are added as those stages land.
+> Started ahead of Stage 8 at the owner's request (2026-11-18) and live at the owner's dashboard
+> host. It manages its own identity system, shows engine/system-DB health, and has an embedded SQL
+> workspace with backups. Cluster screens come with Stage 8.
 
 ## What it does today
 | Area | Details |
@@ -23,14 +23,15 @@ Crate: `crates/novadb-dashboard`. Server-rendered HTML, **no JavaScript**, one b
 | Audit search | Filter by text / event type / user, 50 per page, CSV export (formula-injection safe, the export itself is audited). |
 | Sessions (admin) | Every session of every user with state and expiry; revoke one or "sign out everyone else". Users can sign out all their other devices from Account. |
 | System (operator+) | Runtime (RSS, threads, fds), storage stats, integrity verify, crash-recovery report, system trees, effective security policy. Admins can force a checkpoint. |
+| Databases | Table browser + SQL console over an embedded workspace engine (`<data>/sql`). Operators read-only, admins may write; `CREATE/ALTER/DROP USER` refused (passwords never typed into a web form); max 50 statements / 64 KiB per run, 1,000 rows shown; SELECT limit 10 s (`SET max_execution_time` admin-only). Everything audited (`sql.*`). |
 | Backups (admin) | Logical dumps of the SQL workspace from one snapshot (`DROP/CREATE TABLE` + batched `INSERT`s, literals round-trip exactly) in `<data>/backups` (0700 / 0600, `create_new`, strict generated names only). Header + trailing `-- sha256:` line verified before any restore. Automatic backup when the last one is > 24 h old (checked hourly, newest 14 kept), manual "Back up now" (max 60 files), download, verify, delete. Restore needs password + typed `RESTORE`, takes a `prerestore` safety backup first and puts the old state back if loading fails. The system DB (hashes, TOTP secrets) is never downloadable. All audited (`backup.*`). |
 | Overview | Warnings (no recovery codes, locked users, users without 2FA, failed sign-ins) + recent activity feed. |
 | OAuth (§4.9) | Discord + GitHub, optional (env vars). `state` (single-use, 10 min) + PKCE S256 + browser-binding cookie + exact redirect URI. **Linking only while fully logged in**; login looks up the provider **user id** — no auto-create, no e-mail matching. OAuth skips the password, **never** the TOTP step. |
 | Audit (§4.18) | Append-only, hash-chained (`sha256(prev ‖ fields)`), entry + head written in one transaction. Verified on every Overview/Audit load; tampering, deletion or truncation shows "chain broken". No passwords, codes, tokens or secrets are ever logged. |
 | Proxy (§4.13) | `X-Real-IP` trusted only from `NOVADB_DASH_TRUSTED_PROXY` (default 127.0.0.1). Refuses to bind a non-loopback address without an https public URL. |
 
-Not done yet: **passkeys/WebAuthn** (next), e-mail, per-database permissions
-(needs Stage 3+), REST tokens (Stage 10).
+Not done yet: **passkeys/WebAuthn** (next), e-mail, mapping dashboard users to SQL
+[privileges](sql.md#privileges) (the workspace is an embedded, trusted engine), REST tokens (Stage 10).
 
 ## Configuration (environment)
 | var | default |
