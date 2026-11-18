@@ -5,6 +5,23 @@ All builds and tests run **inside Docker** (`novadb-builder`, `--cpus 2 --memory
 Toolchain: rustc 1.100.0 stable, nightly 2026-11-11 for cargo-fuzz; cargo-deny 0.20.2,
 cargo-audit 0.23.0, cargo-nextest 0.9.152.
 
+## 2026-11-18 — Stage 9 (control dashboard + identity), started early
+Built at the owner's request ahead of Stages 3–8. Details: [docs/dashboard.md](docs/dashboard.md).
+
+| check | result |
+|---|---|
+| `cargo test -p novadb-dashboard` | ✅ 14/14 (TOTP RFC 6238 vectors + replay, PKCE RFC 7636, Argon2id params, policy, limiter, escaping, audit tamper/delete detection, persistence, OAuth state single-use) |
+| clippy `-D warnings` (all targets) | ✅ (`result_large_err` allowed in `web.rs` only: axum `Result<Response, Response>` handlers) |
+| cargo-deny / cargo-audit | ✅ advisories, bans, licences, sources ok (warnings: duplicate `base64`, `windows-sys`) |
+| `scripts/dashboard-e2e.py` on a throwaway container | ✅ 33/33 |
+| one-time admin password file | ✅ 0600, deleted after first password change |
+| Pre-existing Stage 1+2 suite (fresh clone, commit df1b48b, FUZZ_SECS=60) | ✅ 15/15 |
+
+Bugs found while building: wrong expected value in my own PKCE test (code was right; vector re-checked with openssl).
+
+Open: passkeys/WebAuthn, recovery codes, OAuth live test needs Discord/GitHub app credentials,
+per-database permissions (Stage 3+), REST tokens (Stage 10).
+
 ## 2026-11-16 — Stage 1 + Stage 2 (storage engine)
 
 ### What was built
