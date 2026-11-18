@@ -5,6 +5,26 @@ All builds and tests run **inside Docker** (`novadb-builder`, `--cpus 2 --memory
 Toolchain: rustc 1.100.0 stable, nightly 2026-11-11 for cargo-fuzz; cargo-deny 0.20.2,
 cargo-audit 0.23.0, cargo-nextest 0.9.152.
 
+## 2026-11-18 — Stage 3 (single-node SQL)
+Details: [docs/sql.md](docs/sql.md). Hand-written lexer/parser/executor, no new dependencies.
+
+| check | result |
+|---|---|
+| `novadb-sql` unit tests | ✅ 19/19 (lexer, parser incl. depth bombs, decimal/datetime maths, LIKE, key-order properties, row + catalog codecs incl. every truncation) |
+| `tests/sql.rs` | ✅ 10/10 incl. randomised index-vs-full-scan differential test (600 rounds, identical results) |
+| doc-test | ✅ |
+| clippy `-D warnings` workspace | ✅ |
+| fuzz `sql_parse` 60 s | ✅ 1,032,469 runs, no crash |
+| fuzz `sql_exec` 90 s | ✅ 5,652 runs, no crash, storage verify ok after every run |
+| CLI `novadb DIR sql` / `shell` smoke run | ✅ |
+
+Bugs found while building: `INSERT … () VALUES ()` not parsed; DATETIME results ignored the
+column's fractional precision (now rendered from column metadata); EXPLAIN labels aligned with
+MySQL (`const`/`ref`/`range`/`ALL`). All fixed before commit.
+
+Known limits (later stages): no joins/aggregates/subqueries (6), no BEGIN/COMMIT/MVCC (5), sort
+and UPDATE/DELETE sets capped at 1M rows in memory, binary collation, no network server (4).
+
 ## 2026-11-18 — Stage 9 (control dashboard + identity), started early
 Built at the owner's request ahead of Stages 3–8. Details: [docs/dashboard.md](docs/dashboard.md).
 

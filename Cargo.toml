@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 novadb-storage = { path = "crates/novadb-storage" }
 novadb-protocol = { path = "crates/novadb-protocol" }
+novadb-sql = { path = "crates/novadb-sql" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -615,6 +615,7 @@ dependencies = [
 name = "novadb-cli"
 version = "0.1.0"
 dependencies = [
+ "novadb-sql",
  "novadb-storage",
 ]
 
@@ -653,6 +654,9 @@ dependencies = [
 [[package]]
 name = "novadb-sql"
 version = "0.1.0"
+dependencies = [
+ "novadb-storage",
+]
 
 [[package]]
 name = "novadb-storage"

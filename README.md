@@ -2,7 +2,8 @@
 Rust database engine aiming for MySQL/MariaDB wire compatibility. Everything is custom
 (SQL parser, wire protocol, storage engine, Raft) — see [PLAN.md](PLAN.md).
 
-**Status:** Stage 1 (workspace, CI, policies) and Stage 2 (storage engine) done — see
+**Status:** Stage 1 (workspace, CI, policies), Stage 2 (storage engine) and Stage 3 (single-node
+SQL, [docs/sql.md](docs/sql.md)) done — see
 [TESTING.md](TESTING.md) and [docs/storage.md](docs/storage.md). Stage 9 control dashboard +
 identity started early (2026-11-18) — see [docs/dashboard.md](docs/dashboard.md). Not production-ready. No
 compatibility or performance claims until the matching test suites pass.
@@ -11,12 +12,12 @@ compatibility or performance claims until the matching test suites pass.
 | path | what |
 |---|---|
 | `crates/novadb-storage` | pager, buffer pool, B+Tree, WAL, crash recovery, `SimVfs` |
-| `crates/novadb-sql` | SQL parser (Stage 3, placeholder + limits) |
+| `crates/novadb-sql` | SQL: lexer, parser, types, catalog, planner, executor (Stage 3) |
 | `crates/novadb-protocol` | MySQL wire protocol (Stage 4, placeholder + limits) |
 | `crates/novadb-server` | server binary (placeholder; will listen on 127.0.0.1:3307) |
 | `crates/novadb-dashboard` | Stage 9 control dashboard + identity (Argon2id, TOTP, OAuth linking, hash-chained audit log) |
-| `crates/novadb-cli` | `novadb` developer CLI (`put/get/del/scan/trees/drop/verify/stats`) |
-| `fuzz/` | cargo-fuzz targets (page decoder, WAL replay, corrupt DB, B+Tree model) |
+| `crates/novadb-cli` | `novadb` CLI: `sql`, interactive `shell`, plus raw `put/get/del/scan/trees/drop/verify/stats` |
+| `fuzz/` | cargo-fuzz targets (page decoder, WAL replay, corrupt DB, B+Tree model, SQL parser, SQL executor) |
 | `scripts/crash-test.sh` | SIGKILL crash/recovery loop |
 | `scripts/dashboard-e2e.py` | black-box dashboard test (throwaway instance only) |
 | `scripts/security-check.sh` | automated part of the PLAN §4 security review |

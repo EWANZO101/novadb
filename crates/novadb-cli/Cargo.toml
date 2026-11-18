@@ -15,3 +15,4 @@ path = "src/main.rs"
 
 [dependencies]
 novadb-storage.workspace = true
+novadb-sql.workspace = true

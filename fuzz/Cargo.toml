@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 novadb-storage = { path = "../crates/novadb-storage" }
+novadb-sql = { path = "../crates/novadb-sql" }
 
 # Not part of the main workspace (needs nightly + sanitizers).
 [workspace]
@@ -51,6 +52,20 @@ bench = false
 [[bin]]
 name = "btree_model"
 path = "fuzz_targets/btree_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_parse"
+path = "fuzz_targets/sql_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_exec"
+path = "fuzz_targets/sql_exec.rs"
 test = false
 doc = false
 bench = false

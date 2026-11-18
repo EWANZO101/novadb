@@ -1,4 +1,4 @@
-//! `novadb` — developer CLI for the storage engine (Stage 2). SQL shell arrives later.
+//! `novadb` — developer CLI: SQL (Stage 3) plus raw storage-engine commands (Stage 2).
 #![forbid(unsafe_code)]
 
 use novadb_storage::{Db, Options};
@@ -7,6 +7,8 @@ use std::ops::Bound;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
+  novadb DIR sql \"STATEMENTS\"      run SQL (several statements separated by ;)
+  novadb DIR shell                 interactive SQL (reads stdin; end statements with ;)
   novadb DIR put TREE KEY VALUE
   novadb DIR get TREE KEY
   novadb DIR del TREE KEY
@@ -20,6 +22,11 @@ fn run(args: &[String]) -> Result<(), String> {
     let [dir, cmd, rest @ ..] = args else {
         return Err(USAGE.into());
     };
+    match (cmd.as_str(), rest) {
+        ("sql", [stmts]) => return sql_once(dir, stmts),
+        ("shell", []) => return sql_shell(dir),
+        _ => {}
+    }
     let mut db = Db::open(dir, Options::default()).map_err(|e| e.to_string())?;
     let e = |e: novadb_storage::Error| e.to_string();
     let mut out = std::io::stdout().lock();
@@ -92,6 +99,127 @@ fn run(args: &[String]) -> Result<(), String> {
         _ => return Err(USAGE.into()),
     }
     db.close().map_err(e)
+}
+
+/// Render a result like the mysql client.
+fn print_result(r: &novadb_sql::QueryResult, out: &mut impl Write) -> std::io::Result<()> {
+    if !r.is_rows() {
+        writeln!(out, "Query OK, {} row(s) affected", r.affected)?;
+        if r.last_insert_id > 0 {
+            writeln!(out, "last insert id: {}", r.last_insert_id)?;
+        }
+        if let Some(i) = &r.info {
+            writeln!(out, "{i}")?;
+        }
+        return Ok(());
+    }
+    let cells: Vec<Vec<String>> = (0..r.rows.len())
+        .map(|i| {
+            (0..r.columns.len())
+                .map(|c| {
+                    r.text(i, c)
+                        .unwrap_or_else(|| "NULL".into())
+                        .replace('\n', "\\n")
+                })
+                .collect()
+        })
+        .collect();
+    let mut w: Vec<usize> = r.columns.iter().map(|c| c.name.chars().count()).collect();
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            w[i] = w[i].max(c.chars().count()).min(80);
+        }
+    }
+    let line = format!(
+        "+{}+",
+        w.iter()
+            .map(|n| "-".repeat(n + 2))
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    let fmt_row = |vals: &[String]| {
+        let parts: Vec<String> = vals
+            .iter()
+            .zip(&w)
+            .map(|(v, n)| {
+                let v: String = v.chars().take(*n).collect();
+                format!(" {v}{} ", " ".repeat(n - v.chars().count()))
+            })
+            .collect();
+        format!("|{}|", parts.join("|"))
+    };
+    writeln!(out, "{line}")?;
+    writeln!(
+        out,
+        "{}",
+        fmt_row(&r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+    )?;
+    writeln!(out, "{line}")?;
+    for row in &cells {
+        writeln!(out, "{}", fmt_row(row))?;
+    }
+    if !cells.is_empty() {
+        writeln!(out, "{line}")?;
+    }
+    writeln!(out, "{} row(s) in set", cells.len())
+}
+
+fn sql_once(dir: &str, stmts: &str) -> Result<(), String> {
+    let mut db = novadb_sql::Engine::open(dir).map_err(|e| e.to_string())?;
+    let mut out = std::io::stdout().lock();
+    let res = (|| {
+        for stmt in novadb_sql::parse(stmts).map_err(|e| e.to_string())? {
+            let r = db.run(&stmt).map_err(|e| e.to_string())?;
+            print_result(&r, &mut out).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })();
+    db.close().map_err(|e| e.to_string())?;
+    res
+}
+
+fn sql_shell(dir: &str) -> Result<(), String> {
+    use std::io::BufRead;
+    let mut db = novadb_sql::Engine::open(dir).map_err(|e| e.to_string())?;
+    let mut out = std::io::stdout().lock();
+    let mut buf = String::new();
+    let _ = write!(out, "novadb> ");
+    let _ = out.flush();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let t = line.trim();
+        if buf.is_empty()
+            && (t.eq_ignore_ascii_case("exit") || t.eq_ignore_ascii_case("quit") || t == "\\q")
+        {
+            break;
+        }
+        buf.push_str(&line);
+        buf.push('\n');
+        if t.ends_with(';') {
+            match novadb_sql::parse(&buf) {
+                Err(e) => {
+                    let _ = writeln!(out, "{e}");
+                }
+                Ok(stmts) => {
+                    for s in stmts {
+                        match db.run(&s) {
+                            Ok(r) => print_result(&r, &mut out).map_err(|e| e.to_string())?,
+                            Err(e) => {
+                                let _ = writeln!(out, "{e}");
+                            }
+                        }
+                    }
+                }
+            }
+            buf.clear();
+            let _ = write!(out, "novadb> ");
+        } else {
+            let _ = write!(out, "     -> ");
+        }
+        let _ = out.flush();
+    }
+    let _ = writeln!(out);
+    db.close().map_err(|e| e.to_string())
 }
 
 fn main() -> ExitCode {
