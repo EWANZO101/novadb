@@ -10,9 +10,10 @@ PW0 = open(sys.argv[1]).read().strip()
 ok_count = 0
 
 class C:
-    def __init__(self): self.cookies = {}
+    def __init__(self, ip=None): self.cookies = {}; self.ip = ip
     def req(self, method, path, form=None, headers=None):
         h = dict(headers or {})
+        if self.ip: h.setdefault("X-Real-IP", self.ip)  # trusted from 127.0.0.1; own rate-limit bucket
         if self.cookies: h["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
         body = None
         if form is not None:
@@ -116,6 +117,12 @@ s, h, b = v.req("GET", "/users")
 check(s == 403, "viewer blocked from /users")
 s, h, b = v.req("GET", "/audit")
 check(s == 403, "viewer blocked from /audit")
+s, h, b = v.req("GET", "/sessions")
+check(s == 403, "viewer blocked from /sessions")
+s, h, b = v.req("GET", "/system")
+check(s == 403, "viewer blocked from /system")
+s, h, b = v.req("GET", "/audit/export.csv")
+check(s == 403, "viewer blocked from audit CSV export")
 
 # Fresh admin login with MFA, replay protection.
 a2 = C()
@@ -139,6 +146,70 @@ s, h, b = a2.req("GET", "/audit")
 check("Chain intact" in b and "login.fail" in b and "mfa.enrolled" in b, "audit log has events, chain intact")
 check("<script>" not in b, "no unescaped script in audit page")
 check(PW0 not in b and NEWPW not in b and secret not in b, "no passwords/secrets in audit log")
+
+# Recovery codes: generate (password + fresh TOTP), use once at the 2FA step, never twice.
+time.sleep(31 - time.time() % 30)  # the login above consumed the current TOTP step
+s, h, b = a2.req("GET", "/account"); tr = csrf(b)
+check("Recovery codes" in b and "None yet" in b, "account shows no recovery codes yet")
+s, h, b = a2.req("POST", "/account/recovery", {"csrf": tr, "current": "wrong-password-xyz", "code": totp(secret)})
+check("Password or code is wrong" in b, "recovery codes need the right password")
+s, h, b = a2.req("POST", "/account/recovery", {"csrf": tr, "current": NEWPW, "code": totp(secret)})
+codes = re.findall(r"<li><code>([A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4}-[A-Z2-7]{4})</code></li>", b)
+check(len(codes) == 10 and "10 of 10 left" in b, "10 recovery codes shown once")
+s, h, b = a2.req("GET", "/account")
+check(codes[0] not in b, "recovery codes not shown again")
+r1 = C("10.9.0.1")
+s, h, b = r1.req("POST", "/login", {"username": "admin", "password": NEWPW})
+s, h, b = r1.req("GET", "/login/totp"); tr1 = csrf(b)
+check("Use a recovery code" in b, "2FA page offers recovery code")
+s, h, b = r1.req("POST", "/login/recovery", {"csrf": tr1, "recovery": "AAAA-BBBB-CCCC-DDDD"})
+check("not valid" in b, "wrong recovery code refused")
+s, h, b = r1.req("POST", "/login/recovery", {"csrf": tr1, "recovery": codes[0].lower().replace("-", " ")})
+check(s == 303 and h["location"] == "/?ok=recovery", "recovery code signs in (case/dash-insensitive)")
+r2 = C("10.9.0.2")
+s, h, b = r2.req("POST", "/login", {"username": "admin", "password": NEWPW})
+s, h, b = r2.req("GET", "/login/totp"); tr2 = csrf(b)
+s, h, b = r2.req("POST", "/login/recovery", {"csrf": tr2, "recovery": codes[0]})
+check("not valid" in b, "recovery code is single-use")
+s, h, b = r2.req("POST", "/login/recovery", {"csrf": "bad", "recovery": codes[1]})
+check(s == 303 and h["location"] == "/login", "recovery POST needs CSRF token")
+s, h, b = a2.req("GET", "/account")
+check("9 of 10 left" in b, "used code removed from account")
+
+# Audit search / filters / CSV export.
+s, h, b = a2.req("GET", "/audit?cat=recovery")
+check("recovery.generated" in b and "user.created" not in b, "audit category filter")
+s, h, b = a2.req("GET", "/audit?q=%3Cscript%3E")
+check("<script>" not in b and "No events match" in b, "audit search escapes input")
+s, h, b = a2.req("GET", "/audit/export.csv?cat=login")
+check(s == 200 and h.get("content-type", "").startswith("text/csv") and "attachment" in h.get("content-disposition", "")
+      and b.startswith("seq,time_utc,actor,ip,action,detail,hash") and "login.ok" in b and "user.created" not in b, "audit CSV export filtered")
+s, h, b = a2.req("GET", "/audit?cat=audit")
+check("audit.exported" in b, "CSV export is itself audited")
+
+# Sessions (admin): see everyone, revoke one, other user's cookie dies.
+s, h, b = a2.req("GET", "/sessions"); ts = csrf(b)
+check(s == 200 and "All sessions" in b and "This device" in b, "admin sessions page")
+ids = re.findall(r'action="/sessions/revoke">.*?name="id" value="([0-9a-f]{12})"', b)
+check(len(ids) >= 2, "other sessions listed with revoke buttons")
+s, h, b = r1.req("GET", "/")
+check(s == 200, "recovery-code session works")
+for i in ids:
+    a2.req("POST", "/sessions/revoke", {"csrf": ts, "id": i})
+s, h, b = r1.req("GET", "/")
+check(s == 303 and h["location"] == "/login", "admin revoke kills other sessions")
+s, h, b = a2.req("GET", "/")
+check(s == 200, "admin's own session survives")
+
+# System page + checkpoint.
+s, h, b = a2.req("GET", "/system"); tsys = csrf(b)
+check(s == 200 and "Security policy" in b and "dash_audit" in b and "Crash recovery" in b, "system page")
+s, h, b = a2.req("POST", "/system/checkpoint", {"csrf": tsys})
+check(s == 303 and h["location"] == "/system?ok=checkpoint", "checkpoint runs")
+s, h, b = a2.req("POST", "/system/checkpoint", {"csrf": tsys}, {"Origin": "https://evil.example"})
+check(s == 403, "checkpoint blocked cross-site")
+s, h, b = a2.req("GET", "/")
+check("Recent activity" in b and "system.checkpoint" in b, "overview activity feed")
 
 # Admin disables viewer -> viewer session killed.
 s, h, b = a2.req("GET", "/users"); t4 = csrf(b)

@@ -69,6 +69,9 @@ pub struct User {
     pub last_login: u64,
     #[serde(default)]
     pub links: Vec<Link>,
+    /// SHA-256 hashes of unused recovery codes (single use).
+    #[serde(default)]
+    pub recovery: Vec<String>,
 }
 
 /// Where a session is in the login flow.
@@ -263,6 +266,13 @@ impl Store {
         }
         Ok(n)
     }
+    /// Every session (key, session).
+    pub fn all_sessions(&mut self) -> R<Vec<(String, Session)>> {
+        Ok(all_json::<Session>(&mut self.db, self.sessions)?
+            .into_iter()
+            .map(|(k, s)| (String::from_utf8_lossy(&k).into_owned(), s))
+            .collect())
+    }
     pub fn session_count(&mut self) -> R<usize> {
         Ok(all_json::<Session>(&mut self.db, self.sessions)?.len())
     }
@@ -349,6 +359,16 @@ impl Store {
     }
 
     /// Walks the whole chain. Ok(entries) or Err(first problem).
+    /// Every audit entry, newest first.
+    pub fn audit_all(&mut self) -> R<Vec<AuditEntry>> {
+        let mut v: Vec<AuditEntry> = all_json::<AuditEntry>(&mut self.db, self.audit)?
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
+        v.reverse();
+        Ok(v)
+    }
+
     pub fn audit_verify(&mut self) -> R<u64> {
         let (head_seq, head_hash) = self.audit_head()?;
         let mut prev = GENESIS.to_string();
@@ -379,6 +399,35 @@ impl Store {
     }
     pub fn verify_db(&mut self) -> R<VerifyReport> {
         self.db.verify().map_err(se)
+    }
+    /// Flush dirty pages and truncate the WAL now.
+    pub fn checkpoint(&mut self) -> R<()> {
+        self.db.checkpoint().map_err(se)
+    }
+    /// Trees in the system database with their entry counts.
+    pub fn tree_sizes(&mut self) -> R<Vec<(String, u64)>> {
+        let names = self.db.view(|tx| tx.list_trees()).map_err(se)?;
+        let mut out = Vec::with_capacity(names.len());
+        for n in names {
+            let c = self
+                .db
+                .view(|tx| {
+                    let t = tx.open_tree(&n)?;
+                    let mut c = 0u64;
+                    for r in tx.range(&t, ..)? {
+                        r?;
+                        c += 1;
+                    }
+                    Ok(c)
+                })
+                .map_err(se)?;
+            out.push((n, c));
+        }
+        Ok(out)
+    }
+    /// What crash recovery did when this database was opened.
+    pub fn recovery_report(&self) -> novadb_storage::recovery::RecoveryReport {
+        self.db.recovery_report().clone()
     }
 }
 
@@ -487,6 +536,7 @@ mod tests {
                     id: "42".into(),
                     name: "al".into(),
                 }],
+                recovery: vec![],
             };
             s.put_user(&u).unwrap();
             s.link("discord", "42", "alice").unwrap();

@@ -17,13 +17,18 @@ Crate: `crates/novadb-dashboard`. Server-rendered HTML, **no JavaScript**, one b
 | Brute force (§4.5) | Per-IP 10 logins / 5 min and per-user 20 / 5 min **before** hashing; max 2 concurrent Argon2 hashes; 10 wrong passwords → 15 min lock; 6 wrong TOTP codes / 5 min kill the half-authenticated session. nginx adds its own limits in front. |
 | CSRF | Every POST carries a per-session token (constant-time compare) + Origin / Sec-Fetch-Site check. |
 | Headers | CSP `default-src 'none'` (style from self only, no scripts), `frame-ancestors 'none'`, XFO DENY, nosniff, no-referrer, `Cache-Control: no-store`, COOP. |
-| Roles | `viewer` (overview), `operator` (+ audit log), `admin` (+ users). Always at least one active admin; admins cannot act on themselves from the Users page. |
+| Roles | `viewer` (overview, account), `operator` (+ audit log, system), `admin` (+ users, sessions, checkpoint). Always at least one active admin; admins cannot act on themselves from the Users page. |
 | Users | Create (one-time password shown once, must change + enrol 2FA), disable/enable, unlock, reset password, reset 2FA, change role, delete. |
+| Recovery codes | 10 single-use codes (80 bit, base32 `XXXX-XXXX-XXXX-XXXX`), shown once; only SHA-256 stored. Creating them needs password + fresh TOTP. Usable at the 2FA step instead of a TOTP code (same attempt budget). Admin "Reset 2FA" clears them. |
+| Audit search | Filter by text / event type / user, 50 per page, CSV export (formula-injection safe, the export itself is audited). |
+| Sessions (admin) | Every session of every user with state and expiry; revoke one or "sign out everyone else". Users can sign out all their other devices from Account. |
+| System (operator+) | Runtime (RSS, threads, fds), storage stats, integrity verify, crash-recovery report, system trees, effective security policy. Admins can force a checkpoint. |
+| Overview | Warnings (no recovery codes, locked users, users without 2FA, failed sign-ins) + recent activity feed. |
 | OAuth (§4.9) | Discord + GitHub, optional (env vars). `state` (single-use, 10 min) + PKCE S256 + browser-binding cookie + exact redirect URI. **Linking only while fully logged in**; login looks up the provider **user id** — no auto-create, no e-mail matching. OAuth skips the password, **never** the TOTP step. |
 | Audit (§4.18) | Append-only, hash-chained (`sha256(prev ‖ fields)`), entry + head written in one transaction. Verified on every Overview/Audit load; tampering, deletion or truncation shows "chain broken". No passwords, codes, tokens or secrets are ever logged. |
 | Proxy (§4.13) | `X-Real-IP` trusted only from `NOVADB_DASH_TRUSTED_PROXY` (default 127.0.0.1). Refuses to bind a non-loopback address without an https public URL. |
 
-Not done yet: **passkeys/WebAuthn** (next), recovery codes, e-mail, per-database permissions
+Not done yet: **passkeys/WebAuthn** (next), e-mail, per-database permissions
 (needs Stage 3+), REST tokens (Stage 10).
 
 ## Configuration (environment)
@@ -52,6 +57,6 @@ OAuth redirect URIs to register: `<public url>/oauth/discord/callback`, `<public
 * `cargo test -p novadb-dashboard` — TOTP RFC 6238 vectors + replay, base32, PKCE RFC 7636 vector,
   Argon2id parameters, password policy, rate limiter, HTML escaping, audit-chain tamper/delete
   detection, persistence of users/sessions/links across reopen, OAuth state single-use.
-* `scripts/dashboard-e2e.py` — 37 black-box checks (incl. browser-style Origin/Sec-Fetch-Site) against a **throwaway** instance (forced setup,
+* `scripts/dashboard-e2e.py` — 64 black-box checks (incl. browser-style Origin/Sec-Fetch-Site) against a **throwaway** instance (forced setup,
   CSRF/Origin, roles, TOTP replay, session revocation, logout, audit chain, no secrets in log,
   HTTP 429 on brute force).

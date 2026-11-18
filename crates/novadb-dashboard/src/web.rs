@@ -25,6 +25,8 @@ use crate::oauth::{self, Flows, Kind, Mode, Provider};
 use crate::store::{Link, Role, Session, Shared, Stage, User, clip};
 use crate::{auth, totp};
 
+mod more;
+
 pub const SESSION_COOKIE: &str = "__Host-novadb_session";
 const OAUTH_COOKIE: &str = "__Host-novadb_oauth";
 /// Idle timeout.
@@ -84,7 +86,19 @@ pub fn router(app: S) -> Router {
         .route("/users", get(users_page))
         .route("/users/create", post(users_create))
         .route("/users/action", post(users_action))
-        .route("/audit", get(audit_page))
+        .route("/audit", get(more::audit_page))
+        .route("/audit/export.csv", get(more::audit_export))
+        .route("/sessions", get(more::sessions_page))
+        .route("/sessions/revoke", post(more::sessions_revoke))
+        .route("/sessions/revoke_all", post(more::sessions_revoke_all))
+        .route("/system", get(more::system_page))
+        .route("/system/checkpoint", post(more::system_checkpoint))
+        .route("/account/recovery", post(more::recovery_generate))
+        .route(
+            "/account/sessions/revoke_all",
+            post(more::account_revoke_all),
+        )
+        .route("/login/recovery", post(more::login_recovery))
         .route("/oauth/{provider}/start", get(oauth_start_login))
         .route("/oauth/{provider}/link", post(oauth_start_link))
         .route("/oauth/{provider}/callback", get(oauth_callback))
@@ -440,6 +454,12 @@ fn flash_of(q: &MsgQuery) -> Flash<'_> {
             "linked" => "Account linked.",
             "unlinked" => "Account unlinked.",
             "revoked" => "Session signed out.",
+            "revoked_all" => "All other sessions were signed out.",
+            "checkpoint" => "Checkpoint done: cached pages written, WAL emptied.",
+            "slow" => "Too many checkpoints in a short time. Try again in a minute.",
+            "recovery" => {
+                "Signed in with a recovery code. That code is now used up; create new codes under Account if you are running low."
+            }
             "created" => "User created.",
             "done" => "Done.",
             "loggedout" => "You have been signed out.",
@@ -644,8 +664,13 @@ fn mfa_html(c: &Ctx, flash: Flash<'_>) -> String {
 <div class="card"><form method="post" action="/login/totp">{}<label for="c">Authentication code</label>
 <input id="c" class="code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{{6,7}}" maxlength="7" placeholder="000000" required autofocus>
 <button class="block">Verify</button></form>
+<details class="alt"><summary>Lost your device? Use a recovery code</summary>
+<form method="post" action="/login/recovery">{}<label for="r">Recovery code</label>
+<input id="r" type="text" name="recovery" autocomplete="off" spellcheck="false" maxlength="24" placeholder="XXXX-XXXX-XXXX-XXXX" required>
+<button class="ghost block">Use recovery code</button></form></details>
 <form method="post" action="/logout">{}<button class="link">&larr; Use a different account</button></form></div>"#,
             esc(&c.user.name),
+            csrf(&c.sess.csrf),
             csrf(&c.sess.csrf),
             csrf(&c.sess.csrf)
         ),
@@ -995,19 +1020,73 @@ async fn overview(
     Query(q): Query<MsgQuery>,
 ) -> Res {
     let c = guard(&app, &h, client_ip(&app, &peer, &h), Role::Viewer).await?;
-    let (stats, verify, users, sessions, chain) = app
+    let (stats, verify, user_list, sessions, chain, recent) = app
         .store
         .run(|s| {
             let st = s.stats();
             let v = s.verify_db();
-            let users = s.list_users()?.len();
+            let users = s.list_users()?;
             let sessions = s.session_count()?;
             let chain = s.audit_verify();
-            Ok((st, v, users, sessions, chain))
+            let recent = s.audit_recent(8)?;
+            Ok((st, v, users, sessions, chain, recent))
         })
         .await
         .map_err(internal)?;
     let t = now();
+    let users = user_list.len();
+    // Things worth a human look, most urgent first.
+    let mut warn: Vec<(String, &str)> = Vec::new();
+    if c.user.recovery.is_empty() {
+        warn.push((
+            "You have no recovery codes. If you lose your phone you cannot sign in.".into(),
+            r#"<a class="btn ghost sm" href="/account">Create codes</a>"#,
+        ));
+    }
+    if c.user.role >= Role::Admin {
+        let locked = user_list.iter().filter(|u| u.locked_until > t).count();
+        if locked > 0 {
+            warn.push((
+                format!("{locked} account(s) locked after too many wrong passwords."),
+                r#"<a class="btn ghost sm" href="/users">Review</a>"#,
+            ));
+        }
+        let pending = user_list
+            .iter()
+            .filter(|u| !u.disabled && u.totp.is_none())
+            .count();
+        if pending > 0 {
+            warn.push((
+                format!("{pending} user(s) have not finished setting up 2FA yet."),
+                r#"<a class="btn ghost sm" href="/users">Review</a>"#,
+            ));
+        }
+    }
+    let fails = recent
+        .iter()
+        .filter(|e| html::event_class(&e.action) == "bad")
+        .count();
+    if fails >= 3 && c.user.role >= Role::Operator {
+        warn.push((
+            format!("{fails} failed or blocked sign-ins among the latest events."),
+            r#"<a class="btn ghost sm" href="/audit?cat=login">Look</a>"#,
+        ));
+    }
+    let warn_html: String = warn
+        .iter()
+        .map(|(m, a)| {
+            format!(
+                r#"<div class="notice">{}<span>{}</span>{a}</div>"#,
+                html::icon("alert"),
+                esc(m)
+            )
+        })
+        .collect();
+    let feed_link = if c.user.role >= Role::Operator {
+        r#"<a class="r hint" href="/audit">View all &rarr;</a>"#
+    } else {
+        r#"<span class="r hint">latest events</span>"#
+    };
     let (vpill, vtext) = match &verify {
         Ok(r) => (
             "ok",
@@ -1091,7 +1170,7 @@ async fn overview(
         )
     };
     let body = format!(
-        r#"{head}
+        r#"{head}{warn_html}
 <div class="kpis">{k1}{k2}{k3}{k4}{k5}</div>
 <div class="cols cols-32"><div class="card"><div class="card-h">{iact}<h2>System health</h2><span class="r hint">2 checks</span></div>
 <ul class="checks">{c1}{c2}</ul>
@@ -1100,7 +1179,8 @@ async fn overview(
 <div class="card"><div class="card-h">{iflag}<h2>Engine roadmap</h2><span class="r hint">{done} of {total} stages</span></div>
 <div class="card-b"><div class="progress" role="progressbar" aria-valuenow="{done}" aria-valuemin="0" aria-valuemax="{total}"><i class="p{pct}"></i></div></div>
 <ol class="steps">{stage_rows}</ol>
-<div class="card-f">SQL works through the <code>novadb</code> shell and any MySQL client over TLS on 127.0.0.1:3307. Database screens here come next.</div></div></div>"#,
+<div class="card-f">SQL works through the <code>novadb</code> shell and any MySQL client over TLS on 127.0.0.1:3307. Database screens here come next.</div></div></div>
+<div class="card"><div class="card-h">{iact}<h2>Recent activity</h2>{feed_link}</div>{feed}</div>"#,
         head = html::header(
             "Overview",
             &format!(
@@ -1137,6 +1217,7 @@ async fn overview(
         ),
         iact = html::icon("activity"),
         iflag = html::icon("flag"),
+        feed = more::activity_list(&recent, t, true),
         c1 = check_row(vpill == "ok", "Integrity (full verify)", &vtext),
         c2 = check_row(cpill == "ok", "Audit hash chain", &ctext),
         pr = stats.page_reads,
@@ -1168,10 +1249,29 @@ async fn account_page(
 }
 
 async fn account_render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
+    account_render_full(app, c, flash, None).await
+}
+
+/// Account page; `codes` = freshly generated recovery codes to show exactly once.
+async fn account_render_full(
+    app: &App,
+    c: &Ctx,
+    flash: Flash<'_>,
+    codes: Option<&[String]>,
+) -> Res {
     let name = c.user.name.clone();
-    let sessions = app
+    let (sessions, mine) = app
         .store
-        .run(move |s| s.sessions_for(&name))
+        .run(move |s| {
+            let sess = s.sessions_for(&name)?;
+            let mine: Vec<_> = s
+                .audit_all()?
+                .into_iter()
+                .filter(|e| e.actor == name)
+                .take(12)
+                .collect();
+            Ok((sess, mine))
+        })
         .await
         .map_err(internal)?;
     let t = now();
@@ -1230,7 +1330,7 @@ async fn account_render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
     };
     let body = format!(
         r#"{head}
-<div class="cols"><div class="card"><div class="card-h">{ikey}<h2>Change password</h2></div><div class="card-b"><form method="post" action="/account/password">{}
+{reveal}<div class="cols"><div class="card"><div class="card-h">{ikey}<h2>Change password</h2></div><div class="card-b"><form method="post" action="/account/password">{}
 <label>Current password</label><input type="password" name="current" autocomplete="current-password" required maxlength="128">
 <label>New password</label><input type="password" name="new" autocomplete="new-password" required minlength="12" maxlength="128">
 <label>Repeat new password</label><input type="password" name="again" autocomplete="new-password" required minlength="12" maxlength="128">
@@ -1239,8 +1339,14 @@ async fn account_render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
 <form method="post" action="/account/totp/reset">{}<label>Current password</label><input type="password" name="current" required maxlength="128">
 <label>Current 6-digit code</label><input type="text" name="code" inputmode="numeric" required maxlength="7" placeholder="000000">
 <button class="ghost">Move 2FA to a new device</button></form></div></div></div>
+<div class="card"><div class="card-h">{ilb}<h2>Recovery codes</h2><span class="r">{rc_badge}</span></div><div class="card-b"><p class="sub">Single-use codes that replace the 2FA code if you lose your phone. Creating new codes cancels the old ones.</p>
+<form method="post" action="/account/recovery" class="addform three">{csrf_r}<div><label>Current password</label><input type="password" name="current" autocomplete="current-password" required maxlength="128"></div>
+<div><label>Current 6-digit code</label><input type="text" name="code" inputmode="numeric" required maxlength="7" placeholder="000000"></div>
+<button class="ghost">{rc_btn}</button></form></div></div>
 <div class="card"><div class="card-h">{ilink}<h2>Linked logins</h2></div>{links}</div>
-<div class="card"><div class="card-h">{imon}<h2>Active sessions</h2><span class="r hint">{nsess} signed in</span></div><div class="tbl"><table><thead><tr><th>IP</th><th>Device</th><th>Started</th><th>Last seen</th><th></th></tr></thead><tbody>{srows}</tbody></table></div></div>"#,
+<div class="card"><div class="card-h">{imon}<h2>Active sessions</h2><span class="r hint">{nsess} signed in</span></div><div class="tbl"><table><thead><tr><th>IP</th><th>Device</th><th>Started</th><th>Last seen</th><th></th></tr></thead><tbody>{srows}</tbody></table></div>
+<div class="card-f between"><span>Don't recognise a device? Sign it out and change your password.</span><form method="post" action="/account/sessions/revoke_all">{csrf_r}<button class="danger sm"{others_dis}>Sign out all other devices</button></form></div></div>
+<div class="card"><div class="card-h">{iact}<h2>Your recent security activity</h2><span class="r hint">from the audit log</span></div>{activity}</div>"#,
         csrf(&c.sess.csrf),
         csrf(&c.sess.csrf),
         head = html::header(
@@ -1258,6 +1364,37 @@ async fn account_render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
         ilink = html::icon("link"),
         imon = html::icon("monitor"),
         nsess = sessions.len(),
+        ilb = html::icon("life-buoy"),
+        iact = html::icon("activity"),
+        csrf_r = csrf(&c.sess.csrf),
+        others_dis = if sessions.len() <= 1 { " disabled" } else { "" },
+        activity = more::activity_list(&mine, now(), false),
+        rc_badge = match c.user.recovery.len() {
+            0 => r#"<span class="badge warn">None yet</span>"#.to_string(),
+            1..=3 => format!(
+                r#"<span class="badge warn">{} left</span>"#,
+                c.user.recovery.len()
+            ),
+            n => format!(
+                r#"<span class="badge ok">{n} of {} left</span>"#,
+                auth::RECOVERY_CODES
+            ),
+        },
+        rc_btn = if c.user.recovery.is_empty() {
+            "Create recovery codes"
+        } else {
+            "Create new codes"
+        },
+        reveal = match codes {
+            None => String::new(),
+            Some(list) => format!(
+                r#"<div class="card reveal"><div class="card-h">{}<h2>Save your recovery codes now</h2></div><div class="card-b"><p class="sub">They are shown only this once. Store them in your password manager or print them. Each code works one time.</p><ol class="codes">{}</ol></div></div>"#,
+                html::icon("key"),
+                list.iter()
+                    .map(|x| format!("<li><code>{}</code></li>", esc(x)))
+                    .collect::<String>()
+            ),
+        },
     );
     Ok(Html(html::page(
         "Account",
@@ -1593,6 +1730,7 @@ async fn users_create(
                 created: now(),
                 last_login: 0,
                 links: vec![],
+                recovery: vec![],
             })?;
             Ok(true)
         })
@@ -1683,6 +1821,7 @@ async fn users_action(
                 "reset_mfa" => {
                     u.totp = None;
                     u.totp_last = 0;
+                    u.recovery.clear();
                     s.delete_sessions_for(&u.name, None)?;
                 }
                 "role_viewer" | "role_operator" | "role_admin" => {
@@ -1717,66 +1856,6 @@ async fn users_action(
 }
 
 // ----- audit -----------------------------------------------------------------------------
-
-async fn audit_page(
-    State(app): State<S>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    h: HeaderMap,
-) -> Res {
-    let c = guard(&app, &h, client_ip(&app, &peer, &h), Role::Operator).await?;
-    let (rows, chain) = app
-        .store
-        .run(|s| Ok((s.audit_recent(300)?, s.audit_verify())))
-        .await
-        .map_err(internal)?;
-    let chain_html = match chain {
-        Ok(n) => format!(
-            r#"<span class="badge ok"><span class="pulse"></span>Chain intact</span><span class="r hint">{n} entries, each hashed into the next</span>"#
-        ),
-        Err(e) => format!(
-            r#"<span class="badge bad"><span class="pulse"></span>Chain broken</span><span class="r hint">{}</span>"#,
-            esc(&e)
-        ),
-    };
-    let trs: String = rows
-        .iter()
-        .map(|e| {
-            let cls = if e.action.contains("fail") || e.action.contains("locked") || e.action.contains("rate") {
-                "bad"
-            } else {
-                ""
-            };
-            format!(
-                r#"<tr><td class="num">{}</td><td class="mono nw">{}</td><td><b>{}</b></td><td class="mono">{}</td><td><span class="pill {cls}">{}</span></td><td>{}</td><td class="mono" title="{}">{}</td></tr>"#,
-                e.seq,
-                html::ts(e.ts),
-                esc(&e.actor),
-                esc(&e.ip),
-                esc(&e.action),
-                esc(&e.detail),
-                esc(&e.hash),
-                esc(&e.hash[..10.min(e.hash.len())])
-            )
-        })
-        .collect();
-    let body = format!(
-        r#"{head}<div class="card"><div class="card-h">{ic}{chain_html}</div>
-<div class="tbl"><table><thead><tr><th>#</th><th>Time (UTC)</th><th>Who</th><th>IP</th><th>Event</th><th>Detail</th><th>Hash</th></tr></thead><tbody>{trs}</tbody></table></div></div>"#,
-        head = html::header(
-            "Audit log",
-            "Append-only and tamper-evident. Last 300 events, newest first.",
-            ""
-        ),
-        ic = html::icon("audit"),
-    );
-    Ok(Html(html::page(
-        "Audit log",
-        Some(&c.nav("/audit")),
-        Flash::None,
-        &body,
-    ))
-    .into_response())
-}
 
 // ----- OAuth -----------------------------------------------------------------------------
 

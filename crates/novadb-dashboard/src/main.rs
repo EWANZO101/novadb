@@ -63,6 +63,7 @@ fn bootstrap(s: &mut Store, dir: &Path) -> Result<bool, String> {
         created: web::now(),
         last_login: 0,
         links: vec![],
+        recovery: vec![],
     };
     let path = dir.join(INITIAL_PW_FILE);
     let mut f = std::fs::OpenOptions::new()

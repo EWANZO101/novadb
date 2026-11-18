@@ -117,6 +117,19 @@ pub fn icon(name: &str) -> String {
             r#"<rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>"#
         }
         "terminal" => r#"<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>"#,
+        "cpu" => {
+            r#"<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/>"#
+        }
+        "download" => {
+            r#"<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>"#
+        }
+        "search" => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#,
+        "life-buoy" => {
+            r#"<circle cx="12" cy="12" r="10"/><path d="m4.93 4.93 4.24 4.24"/><path d="m14.83 9.17 4.24-4.24"/><path d="m14.83 14.83 4.24 4.24"/><path d="m9.17 14.83-4.24 4.24"/><circle cx="12" cy="12" r="4"/>"#
+        }
+        "settings" => {
+            r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>"#
+        }
         "zap" => {
             r#"<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>"#
         }
@@ -202,6 +215,10 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
             }
             if n.role >= Role::Admin {
                 links.push(("/users", "Users", "users"));
+                links.push(("/sessions", "Sessions", "monitor"));
+            }
+            if n.role >= Role::Operator {
+                links.push(("/system", "System", "cpu"));
             }
             let items: String = links
                 .iter()
@@ -223,6 +240,8 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
                 "/audit" => "Audit log",
                 "/users" => "Users",
                 "/account" => "Account",
+                "/sessions" => "Sessions",
+                "/system" => "System",
                 _ => "Overview",
             };
             format!(
@@ -258,6 +277,27 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
         esc(title),
         css_tag()
     )
+}
+
+/// Badge class for an audit action (failures and blocks stand out).
+pub fn event_class(action: &str) -> &'static str {
+    if action.contains("fail") || action.contains("locked") || action.contains("rate") {
+        "bad"
+    } else if action.starts_with("login.ok")
+        || action.ends_with("enrolled")
+        || action.ends_with("created")
+    {
+        "ok"
+    } else if action.contains("reset")
+        || action.contains("revoked")
+        || action.contains("disable")
+        || action.contains("delete")
+        || action.contains("recovery")
+    {
+        "warn"
+    } else {
+        ""
+    }
 }
 
 /// Human-readable byte count.

@@ -90,6 +90,53 @@ pub fn random_password(len: usize) -> Result<String, String> {
     Ok(out)
 }
 
+/// Number of recovery codes per batch.
+pub const RECOVERY_CODES: usize = 10;
+
+/// Fresh recovery codes, 80 bits each, shown as `XXXX-XXXX-XXXX-XXXX` (base32).
+pub fn recovery_codes() -> Result<Vec<String>, String> {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    (0..RECOVERY_CODES)
+        .map(|_| {
+            let b = random_bytes::<16>()?;
+            let raw: String = b
+                .iter()
+                .map(|x| char::from(A[usize::from(x & 31)]))
+                .collect();
+            Ok(raw
+                .as_bytes()
+                .chunks(4)
+                .map(|c| String::from_utf8_lossy(c).into_owned())
+                .collect::<Vec<_>>()
+                .join("-"))
+        })
+        .collect()
+}
+
+/// Stored form of a recovery code: hash of its normalised text (case, dashes, spaces ignored).
+/// `None` if the input cannot be a recovery code.
+pub fn recovery_hash(code: &str) -> Option<String> {
+    let n: String = code
+        .chars()
+        .filter(|c| !matches!(c, '-' | ' '))
+        // Base32 has no 0/1/8: accept the usual look-alike typos.
+        .map(|c| match c.to_ascii_uppercase() {
+            '0' => 'O',
+            '1' => 'I',
+            '8' => 'B',
+            u => u,
+        })
+        .collect();
+    if n.len() != 16
+        || !n
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+    {
+        return None;
+    }
+    Some(sha256_hex(format!("novadb-recovery:{n}").as_bytes()))
+}
+
 /// Lowercase hex SHA-256.
 pub fn sha256_hex(data: &[u8]) -> String {
     hex(&Sha256::digest(data))
@@ -183,5 +230,26 @@ mod tests {
             pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    #[test]
+    fn recovery_codes_format_and_hash() {
+        let codes = recovery_codes().unwrap();
+        assert_eq!(codes.len(), RECOVERY_CODES);
+        let c = &codes[0];
+        assert_eq!(c.len(), 19);
+        let h = recovery_hash(c).unwrap();
+        assert_eq!(
+            recovery_hash(&c.to_lowercase().replace('-', " ")).unwrap(),
+            h
+        );
+        assert!(recovery_hash("123456").is_none());
+        assert!(recovery_hash("AAAA-AAAA-AAAA-AAA9").is_none());
+        assert_eq!(
+            recovery_hash("OOII-BBAA-AAAA-AAAA"),
+            recovery_hash("0011-88aa-aaaa-aaaa")
+        );
+        let uniq: std::collections::HashSet<_> = codes.iter().collect();
+        assert_eq!(uniq.len(), codes.len());
     }
 }
