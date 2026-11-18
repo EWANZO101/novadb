@@ -1,0 +1,13 @@
+[package]
+name = "novadb-raft"
+description = "NovaDB Raft consensus core (Stage 8): deterministic, I/O-free; elections with PreVote + CheckQuorum, log replication, ReadIndex reads, snapshots, membership changes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
