@@ -72,6 +72,24 @@ pub struct User {
     /// SHA-256 hashes of unused recovery codes (single use).
     #[serde(default)]
     pub recovery: Vec<String>,
+    /// Registered passkeys (WebAuthn credentials).
+    #[serde(default)]
+    pub passkeys: Vec<Passkey>,
+}
+
+/// A WebAuthn credential.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Passkey {
+    /// base64url credential id
+    pub id: String,
+    /// base64url COSE public key
+    pub cose: String,
+    pub alg: i64,
+    pub count: u32,
+    pub name: String,
+    pub created: u64,
+    #[serde(default)]
+    pub last_used: u64,
 }
 
 /// Where a session is in the login flow.
@@ -537,6 +555,7 @@ mod tests {
                     name: "al".into(),
                 }],
                 recovery: vec![],
+                passkeys: vec![],
             };
             s.put_user(&u).unwrap();
             s.link("discord", "42", "alice").unwrap();

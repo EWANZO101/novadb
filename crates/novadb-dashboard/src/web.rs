@@ -28,6 +28,7 @@ use crate::{auth, totp};
 mod bk;
 mod dbs;
 mod more;
+mod pk;
 
 pub const SESSION_COOKIE: &str = "__Host-novadb_session";
 const OAUTH_COOKIE: &str = "__Host-novadb_oauth";
@@ -84,6 +85,12 @@ pub fn router(app: S) -> Router {
         .route("/", get(overview))
         .route("/healthz", get(|| async { "ok" }))
         .route("/static/app.css", get(css))
+        .route("/static/passkey.js", get(pk::script))
+        .route("/account/passkeys/begin", post(pk::register_begin))
+        .route("/account/passkeys/finish", post(pk::register_finish))
+        .route("/account/passkeys/delete", post(pk::delete))
+        .route("/login/passkey/begin", post(pk::login_begin))
+        .route("/login/passkey/finish", post(pk::login_finish))
         .route("/login", get(login_page).post(login_post))
         .route("/login/totp", get(mfa_page).post(mfa_post))
         .route("/logout", post(logout))
@@ -138,7 +145,7 @@ async fn security_headers(req: Request<Body>, next: Next) -> Response {
     set(
         h,
         "content-security-policy",
-        "default-src 'none'; object-src 'none'; style-src 'self'; img-src 'self' data:; form-action 'self' https://discord.com https://github.com; frame-ancestors 'none'; base-uri 'none'",
+        "default-src 'none'; object-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' data:; form-action 'self' https://discord.com https://github.com; frame-ancestors 'none'; base-uri 'none'",
     );
     set(h, "x-frame-options", "DENY");
     set(h, "x-content-type-options", "nosniff");
@@ -473,6 +480,8 @@ fn flash_of(q: &MsgQuery) -> Flash<'_> {
         match k {
             "pw" => "Password changed.",
             "mfa" => "Two-factor authentication is set up.",
+            "passkey_added" => "Passkey added. You can now sign in with it.",
+            "passkey_removed" => "Passkey removed.",
             "linked" => "Account linked.",
             "unlinked" => "Account unlinked.",
             "revoked" => "Session signed out.",
@@ -549,7 +558,10 @@ fn login_html(app: &App, flash: Flash<'_>) -> String {
 <div class="card"><form method="post" action="/login">
 <label for="u">Username</label><input id="u" type="text" name="username" autocomplete="username" required maxlength="32" autofocus>
 <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required maxlength="128">
-<button class="block">Sign in</button></form>{oauth}</div>"#
+<button class="block">Sign in</button></form>{oauth}
+<div class="divider">or</div><button type="button" class="block ghost" id="pk-login">{key}Sign in with a passkey</button><p id="pk-msg" class="hint" role="status"></p></div>
+<script src="/static/passkey.js" defer></script>"#,
+            key = html::icon("key")
         ),
     )
 }
@@ -1148,11 +1160,7 @@ async fn overview(
             "done",
         ),
         ("8", "Replication / Raft cluster", "done"),
-        (
-            "9",
-            "Control dashboard + identity (this page)",
-            "in progress",
-        ),
+        ("9", "Control dashboard + identity (this page)", "done"),
         ("10", "REST / WebSocket + SDKs", "done"),
     ];
     let done = stages.iter().filter(|(_, _, st)| *st == "done").count();
@@ -1369,6 +1377,7 @@ async fn account_render_full(
 <form method="post" action="/account/recovery" class="addform three">{csrf_r}<div><label>Current password</label><input type="password" name="current" autocomplete="current-password" required maxlength="128"></div>
 <div><label>Current 6-digit code</label><input type="text" name="code" inputmode="numeric" required maxlength="7" placeholder="000000"></div>
 <button class="ghost">{rc_btn}</button></form></div></div>
+{passkeys}
 <div class="card"><div class="card-h">{ilink}<h2>Linked logins</h2></div>{links}</div>
 <div class="card"><div class="card-h">{imon}<h2>Active sessions</h2><span class="r hint">{nsess} signed in</span></div><div class="tbl"><table><thead><tr><th>IP</th><th>Device</th><th>Started</th><th>Last seen</th><th></th></tr></thead><tbody>{srows}</tbody></table></div>
 <div class="card-f between"><span>Don't recognise a device? Sign it out and change your password.</span><form method="post" action="/account/sessions/revoke_all">{csrf_r}<button class="danger sm"{others_dis}>Sign out all other devices</button></form></div></div>
@@ -1393,6 +1402,7 @@ async fn account_render_full(
         ilb = html::icon("life-buoy"),
         iact = html::icon("activity"),
         csrf_r = csrf(&c.sess.csrf),
+        passkeys = pk::account_card(&c.user, &c.sess.csrf, now()),
         others_dis = if sessions.len() <= 1 { " disabled" } else { "" },
         activity = more::activity_list(&mine, now(), false),
         rc_badge = match c.user.recovery.len() {
@@ -1652,7 +1662,7 @@ async fn users_render(app: &App, c: &Ctx, flash: Flash<'_>, reveal: Option<(&str
                 let mut a = vec![
                     if u.disabled { btn("enable", "Enable", "") } else { btn("disable", "Disable", "") },
                     btn("reset_pw", "Reset password", ""),
-                    btn("reset_mfa", "Reset 2FA", ""),
+                    btn("reset_mfa", "Reset 2FA + passkeys", ""),
                 ];
                 if u.locked_until > t {
                     a.push(btn("unlock", "Unlock", ""));
@@ -1758,6 +1768,7 @@ async fn users_create(
                 last_login: 0,
                 links: vec![],
                 recovery: vec![],
+                passkeys: vec![],
             })?;
             Ok(true)
         })
@@ -1849,6 +1860,7 @@ async fn users_action(
                     u.totp = None;
                     u.totp_last = 0;
                     u.recovery.clear();
+                    u.passkeys.clear(); // a reset must also lock out a lost/stolen passkey
                     s.delete_sessions_for(&u.name, None)?;
                 }
                 "role_viewer" | "role_operator" | "role_admin" => {

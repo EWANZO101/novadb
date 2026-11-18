@@ -21,6 +21,7 @@ mod sqlws;
 mod store;
 mod totp;
 mod web;
+mod webauthn;
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -66,6 +67,7 @@ fn bootstrap(s: &mut Store, dir: &Path) -> Result<bool, String> {
         last_login: 0,
         links: vec![],
         recovery: vec![],
+        passkeys: vec![],
     };
     let path = dir.join(INITIAL_PW_FILE);
     let mut f = std::fs::OpenOptions::new()
@@ -110,6 +112,7 @@ fn reset_admin(name: &str) -> Result<(), String> {
     u.totp = None;
     u.totp_last = 0;
     u.recovery = vec![];
+    u.passkeys = vec![];
     u.disabled = false;
     u.failed = 0;
     u.locked_until = 0;

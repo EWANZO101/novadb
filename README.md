@@ -16,9 +16,10 @@ suites pass. Test results for every stage: [TESTING.md](TESTING.md).
 | 7 | encrypted backups + binlog, point-in-time recovery, metrics, systemd/Docker | ✅ done | [docs/operations.md](docs/operations.md) |
 | — | privileges: `GRANT` / `REVOKE` / `SHOW GRANTS`, least privilege by default | ✅ done | [docs/sql.md](docs/sql.md#privileges) |
 | — | transactional DDL: `CREATE/DROP TABLE/INDEX` roll back with the transaction | ✅ done | [docs/transactions.md](docs/transactions.md#transactional-ddl) |
-| 8 | replication / custom Raft cluster | ⏳ planned | [PLAN.md](PLAN.md) |
-| 9 | control dashboard + identity (started early, live) | 🟡 in progress | [docs/dashboard.md](docs/dashboard.md) |
-| 10 | REST / WebSocket + SDKs | ⏳ planned | [PLAN.md](PLAN.md) |
+| — | online `ALTER TABLE`: instant changes, online shadow rebuild | ✅ done | [docs/alter.md](docs/alter.md) |
+| 8 | replication / custom Raft cluster (mTLS, join tokens, snapshots) | ✅ done | [docs/cluster.md](docs/cluster.md) |
+| 9 | control dashboard + identity (passkeys, TOTP, recovery codes, OAuth, audit; live) | ✅ done | [docs/dashboard.md](docs/dashboard.md) |
+| 10 | REST / WebSocket + JS/Python SDKs | ✅ done | [docs/rest.md](docs/rest.md) |
 
 How NovaDB avoids MySQL's known problems, and what is next (online `ALTER TABLE`,
 then Stage 8): [docs/mysql-pitfalls.md](docs/mysql-pitfalls.md).
@@ -30,7 +31,7 @@ then Stage 8): [docs/mysql-pitfalls.md](docs/mysql-pitfalls.md).
 | `crates/novadb-sql` | SQL: lexer, parser, types, catalog, planner, executor, MVCC transactions, privileges, backups + binlog |
 | `crates/novadb-protocol` | MySQL wire protocol codec: handshake, auth, result sets, prepared statements (Stage 4) |
 | `crates/novadb-server` | server: TLS-only MySQL protocol on 127.0.0.1:3307, Argon2id users, `--restore`, Prometheus metrics |
-| `crates/novadb-dashboard` | Stage 9 control dashboard + identity (Argon2id, TOTP, recovery codes, OAuth linking, hash-chained audit log, SQL workspace, backups) |
+| `crates/novadb-dashboard` | Stage 9 control dashboard + identity (Argon2id, TOTP, recovery codes, passkeys, OAuth linking, hash-chained audit log, SQL workspace, backups) |
 | `crates/novadb-cli` | `novadb` CLI: `sql`, interactive `shell`, plus raw `put/get/del/scan/trees/drop/verify/stats` |
 | `fuzz/` | cargo-fuzz targets (page decoder, WAL replay, corrupt DB, B+Tree model, SQL parser, SQL executor, protocol decoder) |
 | `scripts/crash-test.sh` | SIGKILL crash/recovery loop |

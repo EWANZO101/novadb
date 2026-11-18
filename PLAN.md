@@ -1,6 +1,6 @@
 # NovaDB — Build Plan (based on Master Spec v0.2)
-Status (2026-11-18): Stages 1–7 done, Stage 9 dashboard in progress (live), privileges + transactional DDL done; next
-online `ALTER TABLE`, then Stage 8. Current state: [README.md](README.md), results: [TESTING.md](TESTING.md).
+Status (2026-11-18): Stages 1–10 done (dashboard live incl. passkeys), plus privileges, transactional DDL and
+online `ALTER TABLE`. Next: the later backlog (JSON, partial indexes, materialized views, parallel query). Current state: [README.md](README.md), results: [TESTING.md](TESTING.md).
 Location: this GitHub repo only (nothing kept on the server, see §6).
 
 ## 0. Reality check
@@ -38,7 +38,7 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 - ✅ **Stage 6 — joins/aggregates/planner**: JOIN, GROUP BY, HAVING, subqueries, cost-based index selection, query timeout/cancel (KILL). *(Done except cost-based selection: rule-based index choice + index nested-loop joins, no join reordering yet — docs/sql.md.)*
 - ✅ **Stage 7 — ops**: Docker image, systemd unit, backup/restore + PITR, Prometheus metrics.
 - ✅ **Stage 8 — replication/cluster (custom Raft)**: leader election (PreVote, CheckQuorum), log replication, ReadIndex reads, snapshots, membership changes, join tokens, mTLS, deterministic partition/crash simulation + 3-node container tests ([docs/cluster.md](docs/cluster.md)).
-- 🟡 **Stage 9 — Control dashboard + Identity** (Argon2id, TOTP, passkeys, Discord/GitHub OAuth, audit log). *(Live at the dashboard; passkeys not done yet — docs/dashboard.md.)*
+- ✅ **Stage 9 — Control dashboard + Identity** (Argon2id, TOTP, passkeys, Discord/GitHub OAuth, audit log). *(Live at the dashboard, incl. passkeys — docs/dashboard.md.)*
 - ✅ **Stage 10 — REST/WebSocket + SDKs**: token-scoped REST CRUD, saved queries, opt-in SQL, WebSocket queries/transactions/live change feed, JS + Python SDKs ([docs/rest.md](docs/rest.md)). Website: later.
 **Later / separate project**: Windows installer, Kubernetes/Helm, NovaDB Cloud + billing, stored procedures, triggers, LSM engine.
 

@@ -294,6 +294,10 @@ table.kv td:first-child{color:var(--mut)}
 table.kv td.r{text-align:right;font-variant-numeric:tabular-nums}
 .card-h.sub2{border-top:1px solid var(--line)}
 .addform.three{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}
+.pkform{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) 150px auto;gap:12px;align-items:end}
+.pkform label{margin-top:0}
+.pkform button{margin:0;height:38px}
+.hint.err{color:var(--bad)}
 .codes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 24px;margin:4px 0 0;padding-left:22px;color:var(--mut)}
 .codes code{font-size:14px;letter-spacing:.06em;color:var(--txt);background:var(--bg2)}
 details.alt{margin-top:18px;border-top:1px solid var(--line);padding-top:14px}
@@ -397,7 +401,7 @@ button.danger-solid:hover{background:color-mix(in srgb,var(--bad) 85%,#000)}
   .metrics{grid-template-columns:minmax(0,1fr)}
   .metrics div{border-right:0;border-bottom:1px solid var(--line)}
   .addform{grid-template-columns:minmax(0,1fr)}
-  .addform.three{grid-template-columns:minmax(0,1fr)}
+  .addform.three,.pkform{grid-template-columns:minmax(0,1fr)}
   .codes{grid-template-columns:minmax(0,1fr)}
   .feed-m small{display:none}
   .filters select{flex:1}

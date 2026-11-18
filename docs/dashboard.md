@@ -25,12 +25,13 @@ Crate: `crates/novadb-dashboard`. Server-rendered HTML, **no JavaScript**, one b
 | System (operator+) | Runtime (RSS, threads, fds), storage stats, integrity verify, crash-recovery report, system trees, effective security policy. Admins can force a checkpoint. |
 | Databases | Table browser + SQL console over an embedded workspace engine (`<data>/sql`). Operators read-only, admins may write; `CREATE/ALTER/DROP USER` refused (passwords never typed into a web form); max 50 statements / 64 KiB per run, 1,000 rows shown; SELECT limit 10 s (`SET max_execution_time` admin-only). Everything audited (`sql.*`). |
 | Backups (admin) | Logical dumps of the SQL workspace from one snapshot (`DROP/CREATE TABLE` + batched `INSERT`s, literals round-trip exactly) in `<data>/backups` (0700 / 0600, `create_new`, strict generated names only). Header + trailing `-- sha256:` line verified before any restore. Automatic backup when the last one is > 24 h old (checked hourly, newest 14 kept), manual "Back up now" (max 60 files), download, verify, delete. Restore needs password + typed `RESTORE`, takes a `prerestore` safety backup first and puts the old state back if loading fails. The system DB (hashes, TOTP secrets) is never downloadable. All audited (`backup.*`). |
+| Passkeys (WebAuthn) | Account → Passkeys: up to 10 per user, discoverable credentials, `userVerification: required` (PIN/biometrics), `attestation: none`; ES256, Ed25519, RS256. Adding one needs password + fresh TOTP (a stolen session cookie cannot plant one). Passkey sign-in replaces password **and** TOTP (phishing-resistant MFA on its own). Server checks type, challenge (single use, 3 min), origin = `NOVADB_DASH_PUBLIC_URL`, RP id hash, UP+UV flags, signature over `authData ‖ SHA-256(clientDataJSON)`, and the signature counter (going backwards = cloned key, refused). Bounded CBOR decoder (`src/webauthn.rs`). Only script on the site: `/static/passkey.js` (CSP `script-src 'self'`, no inline code). Admin "Reset 2FA + passkeys" and `--reset-admin` remove them. Audited: `passkey.add`, `passkey.add_fail`, `passkey.remove`, `login.passkey_ok`, `login.passkey_fail`. |
 | Overview | Warnings (no recovery codes, locked users, users without 2FA, failed sign-ins) + recent activity feed. |
 | OAuth (§4.9) | Discord + GitHub, optional (env vars). `state` (single-use, 10 min) + PKCE S256 + browser-binding cookie + exact redirect URI. **Linking only while fully logged in**; login looks up the provider **user id** — no auto-create, no e-mail matching. OAuth skips the password, **never** the TOTP step. |
 | Audit (§4.18) | Append-only, hash-chained (`sha256(prev ‖ fields)`), entry + head written in one transaction. Verified on every Overview/Audit load; tampering, deletion or truncation shows "chain broken". No passwords, codes, tokens or secrets are ever logged. |
 | Proxy (§4.13) | `X-Real-IP` trusted only from `NOVADB_DASH_TRUSTED_PROXY` (default 127.0.0.1). Refuses to bind a non-loopback address without an https public URL. |
 
-Not done yet: **passkeys/WebAuthn** (next), e-mail, mapping dashboard users to SQL
+Not done yet: e-mail, mapping dashboard users to SQL
 [privileges](sql.md#privileges) (the workspace is an embedded, trusted engine), REST tokens (Stage 10).
 
 ## Configuration (environment)
@@ -62,6 +63,11 @@ OAuth redirect URIs to register: `<public url>/oauth/discord/callback`, `<public
 * `scripts/dashboard-e2e.py` — 100 black-box checks (incl. browser-style Origin/Sec-Fetch-Site) against a **throwaway** instance (forced setup,
   CSRF/Origin, roles, TOTP replay, session revocation, logout, audit chain, no secrets in log,
   HTTP 429 on brute force).
+* `scripts/passkey-e2e.mjs` — 16 real-browser checks: headless Chromium + a virtual platform
+  authenticator over the DevTools protocol (`node scripts/passkey-e2e.mjs http://localhost:PORT
+  <initial-admin-password.txt> <chrome>`; use `localhost`, WebAuthn needs a secure context and
+  `NOVADB_DASH_PUBLIC_URL` must match). Covers register (wrong password refused), passkey-only
+  login, no login without user verification, audit entries, removal.
 
 ## Break-glass admin reset
 
@@ -74,6 +80,6 @@ docker start novadb-dashboard
 docker exec novadb-dashboard cat /data/initial-admin-password.txt
 ```
 
-The user gets a new one-time password, 2FA and recovery codes are cleared, the account is unlocked,
+The user gets a new one-time password, 2FA, recovery codes and passkeys are cleared, the account is unlocked,
 enabled and made admin, and its sessions are revoked. Sign in, set a new password and enrol 2FA again.
 The reset is written to the audit log. There is deliberately no HTTP route for this.
