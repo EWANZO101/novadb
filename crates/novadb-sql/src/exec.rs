@@ -18,6 +18,8 @@ use crate::error::{Result, SqlError};
 use crate::mvcc::{self, Mv, TS_LEN, WriteSet};
 use crate::parser::parse;
 use crate::privs;
+
+mod alter;
 use crate::value::{ArithOp, ColType, Value, arith, coerce, compare, like, sort_cmp};
 
 /// Max rows a statement may hold in memory (sorting, UPDATE/DELETE candidate sets, results).
@@ -116,6 +118,8 @@ pub struct Engine {
     ddl_owner: Option<u32>,
     /// Binlog records held back until that transaction commits.
     deferred: Option<Vec<Record>>,
+    /// Online ALTER TABLE in progress.
+    alter: Option<alter::Job>,
 }
 
 /// Append to the binlog, or hold the record back while a transactional-DDL transaction is open.
@@ -150,8 +154,12 @@ fn system_now() -> i64 {
 }
 
 impl Engine {
+    fn after_open(mut self) -> Result<Engine> {
+        self.cleanup_shadows()?;
+        Ok(self)
+    }
     pub fn open(dir: impl AsRef<Path>) -> Result<Engine> {
-        Ok(Engine {
+        (Engine {
             db: Db::open(dir, Options::default())?,
             clock: Box::new(system_now),
             hasher: None,
@@ -163,10 +171,12 @@ impl Engine {
             enforce: false,
             ddl_owner: None,
             deferred: None,
+            alter: None,
         })
+        .after_open()
     }
     pub fn open_vfs(vfs: Box<dyn Vfs>, opts: Options) -> Result<Engine> {
-        Ok(Engine {
+        (Engine {
             db: Db::open_vfs(vfs, opts)?,
             clock: Box::new(system_now),
             hasher: None,
@@ -178,7 +188,9 @@ impl Engine {
             enforce: false,
             ddl_owner: None,
             deferred: None,
+            alter: None,
         })
+        .after_open()
     }
     /// Replace the clock used by NOW()/CURRENT_TIMESTAMP (tests).
     pub fn with_clock(mut self, f: impl Fn() -> i64 + Send + 'static) -> Self {
@@ -328,8 +340,24 @@ impl Engine {
         Ok(QueryResult::ok(0))
     }
 
-    /// Run one statement for a connection's session.
+    /// Run one statement for a connection's session (an online ALTER TABLE runs to the end).
     pub fn run_in(&mut self, s: &Stmt, sess: &mut Session) -> Result<QueryResult> {
+        let r = self.run_in_start(s, sess)?;
+        if matches!(s, Stmt::AlterTable { .. })
+            && self.alter.as_ref().is_some_and(|j| j.conn == sess.conn_id)
+        {
+            loop {
+                if let Some(r) = self.alter_step()? {
+                    return Ok(r);
+                }
+            }
+        }
+        Ok(r)
+    }
+
+    /// Like `run_in`, but an online ALTER TABLE only starts: while `alter_running()`, call
+    /// `alter_step` until it returns the result, releasing the engine lock between calls.
+    pub fn run_in_start(&mut self, s: &Stmt, sess: &mut Session) -> Result<QueryResult> {
         CURRENT.with(|c| *c.borrow_mut() = sess.clone());
         let conn = sess.conn_id;
         if let Stmt::Set(assignments) = s {
@@ -435,14 +463,22 @@ impl Engine {
             Stmt::CreateTable(_)
             | Stmt::DropTable { .. }
             | Stmt::CreateIndex { .. }
-            | Stmt::DropIndex { .. } => {
+            | Stmt::DropIndex { .. }
+            | Stmt::AlterTable { .. } => {
                 // Inside a transaction (BEGIN or autocommit=0) DDL is transactional: it joins
                 // the transaction and ROLLBACK undoes it. Outside one it is its own transaction.
                 // Either way it needs the tables to itself.
                 let transactional = self.ddl_owner == Some(conn)
                     || self.txns.contains_key(&conn)
                     || self.manual.contains(&conn);
-                if self.txns.keys().any(|c| *c != conn) {
+                if let Some(j) = &self.alter {
+                    let mut e = SqlError::internal(format!(
+                        "Lock wait timeout exceeded; ALTER TABLE on `{}` is in progress (retry when it finishes)",
+                        j.table
+                    ));
+                    e.code = 1205;
+                    Err(e)
+                } else if self.txns.keys().any(|c| *c != conn) {
                     let mut e = SqlError::internal(
                         "Lock wait timeout exceeded; another session has an open transaction (DDL waits for it to COMMIT or ROLLBACK)",
                     );
@@ -461,9 +497,15 @@ impl Engine {
                         self.ddl_owner = Some(conn);
                     }
                     self.pending.clear();
+                    if matches!(s, Stmt::AlterTable { .. }) {
+                        return self.alter_exec(s, conn, false);
+                    }
                     let r = self.exec_stmt(s, conn)?;
                     self.log_after(s)?;
                     Ok(r)
+                } else if matches!(s, Stmt::AlterTable { .. }) {
+                    self.commit_txn(conn)?;
+                    self.alter_exec(s, conn, true)
                 } else {
                     // Old versions in dropped trees are gone; forget them.
                     self.pending.clear();
@@ -487,6 +529,9 @@ impl Engine {
 
     /// Forget a connection (rolls back its open transaction).
     pub fn end_session(&mut self, conn_id: u32) {
+        if self.alter.as_ref().is_some_and(|j| j.conn == conn_id) {
+            self.alter_abort();
+        }
         self.txns.remove(&conn_id);
         self.rollback_ddl(conn_id);
         self.manual.remove(&conn_id);
@@ -563,6 +608,9 @@ impl Engine {
         let r = (|| {
             let cat = catalog(&mut tx)?;
             let ts = mvcc::commit(&mut tx, &cat, &txn.ws, txn.snap, &snaps, &mut self.pending)?;
+            if let Some(j) = self.alter.as_mut() {
+                alter::note(j, &txn.ws.log);
+            }
             gc_pending(&mut tx, &snaps, &mut self.pending)?;
             log_rec(
                 &mut self.binlog,
@@ -660,6 +708,9 @@ impl Engine {
                 if !ws.is_empty() {
                     let ts = mvcc::commit(&mut tx, &cat, &ws, snap, &snaps, &mut self.pending)?;
                     gc_pending(&mut tx, &snaps, &mut self.pending)?;
+                    if let Some(j) = self.alter.as_mut() {
+                        alter::note(j, &ws.log);
+                    }
                     log_rec(
                         &mut self.binlog,
                         &mut self.deferred,
@@ -719,6 +770,9 @@ fn run_stmt(mv: &mut Mv<'_, '_>, s: &Stmt, now: i64) -> Result<QueryResult> {
             unique,
         } => create_index(mv, name, table, cols, *unique),
         Stmt::DropIndex { name, table } => drop_index(mv, name, table),
+        Stmt::AlterTable { .. } => Err(SqlError::internal(
+            "ALTER TABLE runs through Engine::alter_exec",
+        )),
         Stmt::Insert {
             table,
             cols,
@@ -1915,6 +1969,20 @@ fn create_table(mv: &mut Mv<'_, '_>, c: &CreateTable) -> Result<QueryResult> {
         }
         return Err(SqlError::table_exists(&c.name));
     }
+    let mut t = build_table(c)?;
+    t.id = read_counter(mv.tx, b"n", 1)?;
+    write_counter(mv.tx, b"n", t.id + 1)?;
+    mv.tx.create_tree(&t.rows_tree())?;
+    mv.tx.create_tree(&t.overflow_tree())?;
+    for ix in &t.indexes {
+        mv.tx.create_tree(&t.index_tree(ix))?;
+    }
+    save_table(mv.tx, &t)?;
+    Ok(QueryResult::ok(0))
+}
+
+/// Validate a table definition and build its schema (id 0; no storage touched).
+fn build_table(c: &CreateTable) -> Result<Table> {
     if c.cols.is_empty() || c.cols.len() > MAX_COLUMNS {
         return Err(SqlError::unsupported(
             "tables without columns or with more than 1024 columns",
@@ -2054,23 +2122,14 @@ fn create_table(mv: &mut Mv<'_, '_>, c: &CreateTable) -> Result<QueryResult> {
     {
         return Err(SqlError::auto_inc());
     }
-    let id = read_counter(mv.tx, b"n", 1)?;
-    write_counter(mv.tx, b"n", id + 1)?;
-    let t = Table {
-        id,
+    Ok(Table {
+        id: 0,
         name: c.name.clone(),
         cols,
         pk,
         indexes,
         next_index_id,
-    };
-    mv.tx.create_tree(&t.rows_tree())?;
-    mv.tx.create_tree(&t.overflow_tree())?;
-    for ix in &t.indexes {
-        mv.tx.create_tree(&t.index_tree(ix))?;
-    }
-    save_table(mv.tx, &t)?;
-    Ok(QueryResult::ok(0))
+    })
 }
 
 fn drop_table(mv: &mut Mv<'_, '_>, names: &[String], if_exists: bool) -> Result<QueryResult> {
@@ -3498,6 +3557,16 @@ impl Engine {
             }
             Stmt::CreateIndex { table, .. } | Stmt::DropIndex { table, .. } => {
                 self.need(user, privs::INDEX, table)?
+            }
+            Stmt::AlterTable { name, actions } => {
+                self.need(user, privs::ALTER, name)?;
+                for a in actions {
+                    if let AlterAction::RenameTable(n) = a {
+                        // like MySQL: the old name goes away, the new one is created
+                        self.need(user, privs::DROP, name)?;
+                        self.need(user, privs::CREATE, n)?;
+                    }
+                }
             }
             Stmt::Describe(t) | Stmt::ShowCreateTable(t) => self.need(user, privs::TABLE_ALL, t)?,
             Stmt::CreateUser { .. } | Stmt::DropUser { .. } => {

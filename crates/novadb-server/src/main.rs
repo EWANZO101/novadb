@@ -75,13 +75,38 @@ impl Server {
         let started = Instant::now();
         let joined = tokio::task::spawn_blocking(move || {
             novadb_sql::set_cancel_flag(cancel);
-            let (r, status) = match eng.lock() {
+            let (mut r, mut status) = match eng.lock() {
                 Ok(mut e) => {
-                    let r = e.run_in(&st, &mut s);
+                    let r = e.run_in_start(&st, &mut s);
                     (r, e.status(s.conn_id))
                 }
                 Err(_) => (Err(SqlError::internal("engine lock poisoned")), 2),
             };
+            // Online ALTER TABLE: one batch per lock hold, so other sessions keep running.
+            if r.is_ok() && matches!(st, Stmt::AlterTable { .. }) {
+                loop {
+                    let step = match eng.lock() {
+                        Ok(mut e) if e.alter_owner() == Some(s.conn_id) => {
+                            let x = e.alter_step();
+                            status = e.status(s.conn_id);
+                            x
+                        }
+                        Ok(_) => break,
+                        Err(_) => Err(SqlError::internal("engine lock poisoned")),
+                    };
+                    match step {
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                        Ok(Some(done)) => {
+                            r = Ok(done);
+                            break;
+                        }
+                        Err(e) => {
+                            r = Err(e);
+                            break;
+                        }
+                    }
+                }
+            }
             novadb_sql::set_cancel_flag(None);
             (r, status, s)
         })

@@ -19,6 +19,11 @@ pub enum Stmt {
         name: String,
         table: String,
     },
+    /// ALTER TABLE name action, action, …
+    AlterTable {
+        name: String,
+        actions: Vec<AlterAction>,
+    },
     Insert {
         table: String,
         cols: Option<Vec<String>>,
@@ -433,4 +438,45 @@ pub fn bind_params(s: &mut Stmt, vals: &[Value]) -> Result<(), crate::SqlError> 
         Some(_) => Err(crate::SqlError::param_count()),
         None => Ok(()),
     }
+}
+
+/// Where ADD/MODIFY/CHANGE COLUMN puts the column.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColPos {
+    Keep,
+    First,
+    After(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    AddColumn {
+        def: ColumnDef,
+        pos: ColPos,
+    },
+    DropColumn(String),
+    /// MODIFY (old == def.name) or CHANGE old new-def.
+    ModifyColumn {
+        old: String,
+        def: ColumnDef,
+        pos: ColPos,
+    },
+    RenameColumn {
+        old: String,
+        new: String,
+    },
+    /// ALTER COLUMN c SET DEFAULT v / DROP DEFAULT (None).
+    SetDefault {
+        col: String,
+        default: Option<DefaultExpr>,
+    },
+    AddIndex(IndexDef),
+    DropIndex(String),
+    RenameIndex {
+        old: String,
+        new: String,
+    },
+    AddPrimaryKey(Vec<String>),
+    DropPrimaryKey,
+    RenameTable(String),
 }

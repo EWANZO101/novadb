@@ -135,7 +135,10 @@ fn reset_admin(name: &str) -> Result<(), String> {
         &format!("break-glass reset of '{name}': new one-time password, 2FA cleared, {n} session(s) revoked"),
     )?;
     s.close()?;
-    println!("[dashboard] reset '{name}'; one-time password is in {}", path.display());
+    println!(
+        "[dashboard] reset '{name}'; one-time password is in {}",
+        path.display()
+    );
     Ok(())
 }
 

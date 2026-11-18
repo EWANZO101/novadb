@@ -519,6 +519,10 @@ impl<'a> Parser<'a> {
                 if_not_exists,
             });
         }
+        if self.is_kw("alter") && self.is_kw_at(1, "table") {
+            self.i += 2;
+            return self.alter_table();
+        }
         if self.is_kw("alter") && self.is_kw_at(1, "user") {
             self.i += 2;
             let if_exists = if self.eat_kw("if") {
@@ -787,6 +791,166 @@ impl<'a> Parser<'a> {
         Ok(DefaultExpr::Value(v))
     }
 
+    fn column_def(&mut self) -> Result<ColumnDef> {
+        let cname = self.ident()?;
+        let ty = self.col_type()?;
+        let mut c = ColumnDef {
+            name: cname,
+            ty,
+            nullable: true,
+            default: None,
+            auto_inc: false,
+            primary: false,
+            unique: false,
+        };
+        let mut saw_null = false;
+        loop {
+            if self.eat_kw("not") {
+                self.kw("null")?;
+                c.nullable = false;
+                saw_null = true;
+            } else if self.eat_kw("null") {
+                c.nullable = true;
+                saw_null = true;
+            } else if self.eat_kw("default") {
+                c.default = Some(self.default_value()?);
+            } else if self.eat_kw("auto_increment") {
+                c.auto_inc = true;
+            } else if self.eat_kw("primary") {
+                self.kw("key")?;
+                c.primary = true;
+            } else if self.eat_kw("unique") {
+                let _ = self.eat_kw("key");
+                c.unique = true;
+            } else if self.eat_kw("comment") {
+                match self.bump() {
+                    Tok::Str(_) => {}
+                    _ => return Err(self.err("expected comment string")),
+                }
+            } else {
+                break;
+            }
+        }
+        if c.primary && !saw_null {
+            c.nullable = false;
+        }
+        Ok(c)
+    }
+
+    fn col_pos(&mut self) -> Result<ColPos> {
+        if self.eat_kw("first") {
+            Ok(ColPos::First)
+        } else if self.eat_kw("after") {
+            Ok(ColPos::After(self.ident()?))
+        } else {
+            Ok(ColPos::Keep)
+        }
+    }
+
+    fn alter_table(&mut self) -> Result<Stmt> {
+        let name = self.ident()?;
+        let mut actions = Vec::new();
+        loop {
+            if self.eat_kw("algorithm") || self.eat_kw("lock") {
+                // ALGORITHM=INPLACE/INSTANT/COPY, LOCK=NONE/…: accepted; NovaDB always picks
+                // instant or online when it can.
+                let _ = self.eat_sym("=");
+                self.bump();
+            } else if self.eat_kw("add") {
+                let _ = self.eat_kw("constraint")
+                    && !self.is_kw("primary")
+                    && !self.is_kw("unique")
+                    && self.ident().is_ok();
+                if self.eat_kw("primary") {
+                    self.kw("key")?;
+                    actions.push(AlterAction::AddPrimaryKey(self.ident_list()?));
+                } else if self.is_kw("unique") || self.is_kw("index") || self.is_kw("key") {
+                    let unique = self.eat_kw("unique");
+                    let _ = self.eat_kw("key") || self.eat_kw("index");
+                    let iname = if matches!(self.peek(), Tok::Sym("(")) {
+                        None
+                    } else {
+                        Some(self.ident()?)
+                    };
+                    actions.push(AlterAction::AddIndex(IndexDef {
+                        name: iname,
+                        cols: self.ident_list()?,
+                        unique,
+                    }));
+                } else {
+                    let _ = self.eat_kw("column");
+                    let def = self.column_def()?;
+                    let pos = self.col_pos()?;
+                    actions.push(AlterAction::AddColumn { def, pos });
+                }
+            } else if self.eat_kw("drop") {
+                if self.eat_kw("primary") {
+                    self.kw("key")?;
+                    actions.push(AlterAction::DropPrimaryKey);
+                } else if self.eat_kw("index") || self.eat_kw("key") {
+                    actions.push(AlterAction::DropIndex(self.ident()?));
+                } else {
+                    let _ = self.eat_kw("column");
+                    actions.push(AlterAction::DropColumn(self.ident()?));
+                }
+            } else if self.eat_kw("modify") {
+                let _ = self.eat_kw("column");
+                let def = self.column_def()?;
+                let pos = self.col_pos()?;
+                actions.push(AlterAction::ModifyColumn {
+                    old: def.name.clone(),
+                    def,
+                    pos,
+                });
+            } else if self.eat_kw("change") {
+                let _ = self.eat_kw("column");
+                let old = self.ident()?;
+                let def = self.column_def()?;
+                let pos = self.col_pos()?;
+                actions.push(AlterAction::ModifyColumn { old, def, pos });
+            } else if self.eat_kw("rename") {
+                if self.eat_kw("column") {
+                    let old = self.ident()?;
+                    self.kw("to")?;
+                    let new = self.ident()?;
+                    actions.push(AlterAction::RenameColumn { old, new });
+                } else if self.eat_kw("index") || self.eat_kw("key") {
+                    let old = self.ident()?;
+                    self.kw("to")?;
+                    let new = self.ident()?;
+                    actions.push(AlterAction::RenameIndex { old, new });
+                } else {
+                    let _ = self.eat_kw("to") || self.eat_kw("as");
+                    actions.push(AlterAction::RenameTable(self.ident()?));
+                }
+            } else if self.eat_kw("alter") {
+                let _ = self.eat_kw("column");
+                let col = self.ident()?;
+                if self.eat_kw("set") {
+                    self.kw("default")?;
+                    let d = self.default_value()?;
+                    actions.push(AlterAction::SetDefault {
+                        col,
+                        default: Some(d),
+                    });
+                } else {
+                    self.kw("drop")?;
+                    self.kw("default")?;
+                    actions.push(AlterAction::SetDefault { col, default: None });
+                }
+            } else {
+                return Err(self.err("expected ADD, DROP, MODIFY, CHANGE, RENAME or ALTER"));
+            }
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        if actions.is_empty() {
+            return Err(self.err("nothing to alter"));
+        }
+        Ok(Stmt::AlterTable { name, actions })
+    }
+
     fn create_table(&mut self) -> Result<Stmt> {
         let if_not_exists = if self.eat_kw("if") {
             self.kw("not")?;
@@ -824,48 +988,7 @@ impl<'a> Parser<'a> {
                     unique,
                 });
             } else {
-                let cname = self.ident()?;
-                let ty = self.col_type()?;
-                let mut c = ColumnDef {
-                    name: cname,
-                    ty,
-                    nullable: true,
-                    default: None,
-                    auto_inc: false,
-                    primary: false,
-                    unique: false,
-                };
-                let mut saw_null = false;
-                loop {
-                    if self.eat_kw("not") {
-                        self.kw("null")?;
-                        c.nullable = false;
-                        saw_null = true;
-                    } else if self.eat_kw("null") {
-                        c.nullable = true;
-                        saw_null = true;
-                    } else if self.eat_kw("default") {
-                        c.default = Some(self.default_value()?);
-                    } else if self.eat_kw("auto_increment") {
-                        c.auto_inc = true;
-                    } else if self.eat_kw("primary") {
-                        self.kw("key")?;
-                        c.primary = true;
-                    } else if self.eat_kw("unique") {
-                        let _ = self.eat_kw("key");
-                        c.unique = true;
-                    } else if self.eat_kw("comment") {
-                        match self.bump() {
-                            Tok::Str(_) => {}
-                            _ => return Err(self.err("expected comment string")),
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if c.primary && !saw_null {
-                    c.nullable = false;
-                }
+                let c = self.column_def()?;
                 cols.push(c);
             }
             if self.eat_sym(",") {

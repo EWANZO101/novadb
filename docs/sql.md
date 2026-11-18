@@ -16,7 +16,7 @@ long, 1264 out of range, …) so the Stage 4 wire protocol can pass them through
 ## Supported
 | Area | What works |
 |---|---|
-| DDL | `CREATE TABLE [IF NOT EXISTS]` (column + table level `PRIMARY KEY`, `UNIQUE [KEY]`, `KEY/INDEX`, `NOT NULL`, `DEFAULT literal`, `DEFAULT CURRENT_TIMESTAMP`, `AUTO_INCREMENT`, `COMMENT`; `ENGINE=`/charset options accepted and ignored), `DROP TABLE [IF EXISTS] a, b`, `CREATE [UNIQUE] INDEX … ON t (…)` (built from existing rows, uniqueness checked), `DROP INDEX … ON t` |
+| DDL | `CREATE TABLE [IF NOT EXISTS]` (column + table level `PRIMARY KEY`, `UNIQUE [KEY]`, `KEY/INDEX`, `NOT NULL`, `DEFAULT literal`, `DEFAULT CURRENT_TIMESTAMP`, `AUTO_INCREMENT`, `COMMENT`; `ENGINE=`/charset options accepted and ignored), `DROP TABLE [IF EXISTS] a, b`, `CREATE [UNIQUE] INDEX … ON t (…)` (built from existing rows, uniqueness checked), `DROP INDEX … ON t`, `ALTER TABLE` (instant / online — [alter.md](alter.md)) |
 | DML | `INSERT INTO t [(cols)] VALUES (…), (…)` (also `() VALUES ()`), `UPDATE … SET … [WHERE] [ORDER BY] [LIMIT]`, `DELETE FROM … [WHERE] [ORDER BY] [LIMIT]` |
 | Queries | `SELECT [DISTINCT] exprs | * | t.* FROM t [AS a] [[INNER|LEFT|RIGHT|CROSS] JOIN u [AS b] ON …|USING (…) | , u …] [WHERE] [GROUP BY …] [HAVING …] [ORDER BY expr|alias|position [ASC|DESC], …] [LIMIT n [OFFSET m] | LIMIT m, n]`, `SELECT` without `FROM` (Stage 6) |
 | Aggregates | `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX/GROUP_CONCAT([DISTINCT] …)`, `GROUP_CONCAT(… SEPARATOR '…')`; aggregates over joins; HAVING with aliases; ORDER BY aggregates |

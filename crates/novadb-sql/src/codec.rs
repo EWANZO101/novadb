@@ -151,12 +151,14 @@ pub fn row_decode(b: &[u8], expect: usize) -> Result<Vec<Value>> {
         return Err(SqlError::corrupt("row: unknown format version"));
     }
     let n = usize::from(u16::from_le_bytes(r.arr()?));
-    if n != expect {
+    // Fewer stored values than columns: columns added later by an instant ALTER TABLE
+    // (always nullable without default) read as NULL.
+    if n > expect {
         return Err(SqlError::corrupt(format!(
             "row: {n} columns, schema has {expect}"
         )));
     }
-    let mut row = Vec::with_capacity(n);
+    let mut row = Vec::with_capacity(expect);
     for _ in 0..n {
         row.push(match r.u8()? {
             R_NULL => Value::Null,
@@ -188,6 +190,7 @@ pub fn row_decode(b: &[u8], expect: usize) -> Result<Vec<Value>> {
     if r.i != b.len() {
         return Err(SqlError::corrupt("row: trailing bytes"));
     }
+    row.resize(expect, Value::Null);
     Ok(row)
 }
 
