@@ -33,7 +33,7 @@ pub const IDLE: u64 = 30 * 60;
 pub const ABSOLUTE: u64 = 12 * 3600;
 const MAX_FAILED: u32 = 10;
 const LOCK_SECS: u64 = 15 * 60;
-const CSS: &str = include_str!("../static/app.css");
+pub const CSS: &str = include_str!("../static/app.css");
 
 pub struct Config {
     pub public_url: String,
@@ -181,7 +181,7 @@ fn err_page(code: StatusCode, msg: &str) -> Response {
             "Error",
             None,
             Flash::Err(msg),
-            r#"<p><a href="/">Back</a></p>"#,
+            r#"<h1>Something went wrong</h1><p class="sub">The request could not be completed.</p><p><a class="btn ghost" href="/">&larr; Back to dashboard</a></p>"#,
         )),
     )
         .into_response()
@@ -484,8 +484,9 @@ fn login_html(app: &App, flash: Flash<'_>) -> String {
         .iter()
         .map(|p| {
             format!(
-                r#"<a href="/oauth/{}/start">Sign in with {}</a>"#,
+                r#"<a href="/oauth/{}/start">{}Continue with {}</a>"#,
                 p.kind.id(),
+                html::icon("link"),
                 p.kind.label()
             )
         })
@@ -494,7 +495,7 @@ fn login_html(app: &App, flash: Flash<'_>) -> String {
         String::new()
     } else {
         format!(
-            r#"<div class="oauth">{oauth}</div><p class="hint">Social sign-in only works after you link it under Account. You still need your 2FA code.</p>"#
+            r#"<div class="divider">or</div><div class="oauth">{oauth}</div><p class="hint">Works only for logins linked under Account. Your 2FA code is still required.</p>"#
         )
     };
     html::page(
@@ -502,11 +503,11 @@ fn login_html(app: &App, flash: Flash<'_>) -> String {
         None,
         flash,
         &format!(
-            r#"<div class="card"><h1><span class="dot" style="display:inline-block"></span> NovaDB</h1><p class="sub">Control dashboard</p>
-<form method="post" action="/login">
+            r#"<h1>Sign in</h1><p class="sub">Welcome back. Sign in to the NovaDB control plane.</p>
+<div class="card"><form method="post" action="/login">
 <label for="u">Username</label><input id="u" type="text" name="username" autocomplete="username" required maxlength="32" autofocus>
 <label for="p">Password</label><input id="p" type="password" name="password" autocomplete="current-password" required maxlength="128">
-<button>Sign in</button></form>{oauth}</div>"#
+<button class="block">Sign in</button></form>{oauth}</div>"#
         ),
     )
 }
@@ -639,11 +640,11 @@ fn mfa_html(c: &Ctx, flash: Flash<'_>) -> String {
         None,
         flash,
         &format!(
-            r#"<div class="card"><h1>Two-factor check</h1><p class="sub">Enter the 6-digit code from your authenticator app for <b>{}</b>.</p>
-<form method="post" action="/login/totp">{}<label for="c">Code</label>
-<input id="c" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{{6,7}}" maxlength="7" required autofocus>
-<button>Verify</button></form>
-<form method="post" action="/logout">{}<button class="ghost" style="margin-top:12px">Cancel</button></form></div>"#,
+            r#"<h1>Two-factor check</h1><p class="sub">Enter the 6-digit code from your authenticator app for <b>{}</b>.</p>
+<div class="card"><form method="post" action="/login/totp">{}<label for="c">Authentication code</label>
+<input id="c" class="code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{{6,7}}" maxlength="7" placeholder="000000" required autofocus>
+<button class="block">Verify</button></form>
+<form method="post" action="/logout">{}<button class="link">&larr; Use a different account</button></form></div>"#,
             esc(&c.user.name),
             csrf(&c.sess.csrf),
             csrf(&c.sess.csrf)
@@ -769,11 +770,11 @@ fn setpw_html(c: &Ctx, flash: Flash<'_>) -> String {
         None,
         flash,
         &format!(
-            r#"<div class="card"><h1>Choose a new password</h1><p class="sub">Required before you continue. At least 12 characters; a few random words works well.</p>
-<form method="post" action="/setup/password">{}
+            r#"<div class="steps-auth" aria-label="Step 1 of 2"><i class="on"></i><i></i></div><h1>Choose a new password</h1><p class="sub">Step 1 of 2. At least 12 characters; a few random words works well.</p>
+<div class="card"><form method="post" action="/setup/password">{}
 <label for="a">New password</label><input id="a" type="password" name="new" autocomplete="new-password" required minlength="12" maxlength="128" autofocus>
 <label for="b">Repeat it</label><input id="b" type="password" name="again" autocomplete="new-password" required minlength="12" maxlength="128">
-<button>Save password</button></form></div>"#,
+<button class="block">Save and continue</button></form></div>"#,
             csrf(&c.sess.csrf)
         ),
     )
@@ -917,10 +918,10 @@ fn enrol_html(c: &Ctx, secret: &str, flash: Flash<'_>) -> String {
         None,
         flash,
         &format!(
-            r#"<div class="card"><h1>Set up two-factor sign-in</h1><p class="sub">Required for every account. Scan this with an authenticator app (Google Authenticator, Authy, 1Password, Bitwarden...).</p>
-<div class="qr">{}</div><label>Or type this key</label><div class="secret">{}</div>
-<form method="post" action="/setup/totp">{}<label for="c">Then enter the 6-digit code it shows</label>
-<input id="c" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required autofocus><button>Turn on 2FA</button></form></div>"#,
+            r#"<div class="steps-auth" aria-label="Step 2 of 2"><i class="on"></i><i class="on"></i></div><h1>Set up two-factor sign-in</h1><p class="sub">Step 2 of 2. Scan with an authenticator app (1Password, Bitwarden, Authy, Google Authenticator).</p>
+<div class="card"><div class="qrwrap"><div class="qr">{}</div></div><label>Or enter this key manually</label><div class="secret">{}</div>
+<form method="post" action="/setup/totp">{}<label for="c">6-digit code from the app</label>
+<input id="c" class="code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000000" required autofocus><button class="block">Turn on 2FA</button></form></div>"#,
             qr_svg(&uri),
             esc(&grouped.join(" ")),
             csrf(&c.sess.csrf)
@@ -1049,51 +1050,101 @@ async fn overview(
         ),
         ("10", "REST / WebSocket + SDKs", "planned"),
     ];
+    let done = stages.iter().filter(|(_, _, st)| *st == "done").count();
+    let pct = (done * 100 / stages.len()).div_ceil(10) * 10;
     let stage_rows: String = stages
         .iter()
-        .map(|(n, d, s)| {
-            let cls = match *s {
-                "done" => "ok",
-                "in progress" => "warn",
-                _ => "",
+        .map(|(n, d, st)| {
+            let (cls, badge, num) = match *st {
+                "done" => ("done", r#"<span class="badge ok">Done</span>"#.to_string(), html::icon("check")),
+                "in progress" => ("now", r#"<span class="badge warn">In progress</span>"#.to_string(), (*n).to_string()),
+                _ => ("planned", r#"<span class="badge">Planned</span>"#.to_string(), (*n).to_string()),
             };
             format!(
-                r#"<tr><td>{n}</td><td>{d}</td><td><span class="pill {cls}">{s}</span></td></tr>"#
+                r#"<li class="{cls}"><span class="n" title="Stage {n}">{num}</span><span class="d">{d}</span>{badge}</li>"#
             )
         })
         .collect();
+    let healthy = vpill == "ok" && cpill == "ok";
+    let status_badge = if healthy {
+        r#"<span class="badge ok"><span class="pulse"></span>All systems healthy</span>"#
+    } else {
+        r#"<span class="badge bad"><span class="pulse"></span>Attention needed</span>"#
+    };
+    let check_row = |ok: bool, title: &str, detail: &str| {
+        format!(
+            r#"<li><span class="st {}">{}</span><span class="t"><b>{title}</b><span>{}</span></span><span class="v">{}</span></li>"#,
+            if ok { "ok" } else { "bad" },
+            html::icon(if ok { "check" } else { "x" }),
+            esc(detail),
+            if ok {
+                r#"<span class="pill ok">Passing</span>"#
+            } else {
+                r#"<span class="pill bad">Failing</span>"#
+            }
+        )
+    };
+    let kpi = |ic: &str, label: &str, value: String, note: &str| {
+        format!(
+            r#"<div class="kpi"><div class="kpi-h"><span>{label}</span><span class="ic">{}</span></div><b>{value}</b><small>{note}</small></div>"#,
+            html::icon(ic)
+        )
+    };
     let body = format!(
-        r#"<h1>Overview</h1><p class="sub">Signed in as {} · last sign-in {}</p>
-<div class="grid">
-<div class="stat"><b>{}</b><span>dashboard uptime</span></div>
-<div class="stat"><b>{users}</b><span>users</span></div>
-<div class="stat"><b>{sessions}</b><span>active sessions</span></div>
-<div class="stat"><b>{}</b><span>system DB size</span></div>
-<div class="stat"><b>{}</b><span>WAL</span></div></div>
-<div class="cols"><div class="card"><h2>System database</h2>
-<table><tr><th>Check</th><th>Status</th></tr>
-<tr><td>Integrity (full verify)</td><td><span class="pill {vpill}">{}</span> {}</td></tr>
-<tr><td>Audit hash chain</td><td><span class="pill {cpill}">{}</span> {}</td></tr>
-<tr><td>Pages read / written</td><td>{} / {}</td></tr>
-<tr><td>Checkpoints</td><td>{}</td></tr>
-<tr><td>Buffer pool</td><td>{} pages ({})</td></tr></table>
-<p class="hint">The dashboard keeps its own users, sessions and audit log in NovaDB's storage engine.</p></div>
-<div class="card"><h2>Engine roadmap</h2><table><tr><th>#</th><th>Stage</th><th></th></tr>{stage_rows}</table>
-<p class="hint">SQL works through the <code>novadb</code> shell and any MySQL client over TLS on 127.0.0.1:3307. Database screens here come next.</p></div></div>"#,
-        esc(&c.user.name),
-        html::ago(t, c.user.last_login),
-        html::ago(t, app.started).replace(" ago", ""),
-        html::bytes(stats.page_count * novadb_storage::page::PAGE_SIZE as u64),
-        html::bytes(stats.wal_bytes),
-        if vpill == "ok" { "ok" } else { "error" },
-        esc(&vtext),
-        if cpill == "ok" { "ok" } else { "error" },
-        esc(&ctext),
-        stats.page_reads,
-        stats.page_writes,
-        stats.checkpoints,
-        stats.cache_pages,
-        html::bytes(stats.cache_pages as u64 * novadb_storage::page::PAGE_SIZE as u64),
+        r#"{head}
+<div class="kpis">{k1}{k2}{k3}{k4}{k5}</div>
+<div class="cols cols-32"><div class="card"><div class="card-h">{iact}<h2>System health</h2><span class="r hint">2 checks</span></div>
+<ul class="checks">{c1}{c2}</ul>
+<div class="metrics"><div><span>Pages read / written</span><b>{pr} / {pw}</b></div><div><span>Checkpoints</span><b>{cp}</b></div><div><span>Buffer pool</span><b>{bp} pages</b> <small class="hint">{bpb}</small></div></div>
+<div class="card-f">The dashboard keeps its own users, sessions and audit log in NovaDB's storage engine.</div></div>
+<div class="card"><div class="card-h">{iflag}<h2>Engine roadmap</h2><span class="r hint">{done} of {total} stages</span></div>
+<div class="card-b"><div class="progress" role="progressbar" aria-valuenow="{done}" aria-valuemin="0" aria-valuemax="{total}"><i class="p{pct}"></i></div></div>
+<ol class="steps">{stage_rows}</ol>
+<div class="card-f">SQL works through the <code>novadb</code> shell and any MySQL client over TLS on 127.0.0.1:3307. Database screens here come next.</div></div></div>"#,
+        head = html::header(
+            "Overview",
+            &format!(
+                "Signed in as <b>{}</b> · last sign-in {}",
+                esc(&c.user.name),
+                html::ago(t, c.user.last_login)
+            ),
+            status_badge
+        ),
+        k1 = kpi(
+            "clock",
+            "Uptime",
+            html::ago(t, app.started).replace(" ago", ""),
+            "dashboard process"
+        ),
+        k2 = kpi("users", "Users", users.to_string(), "accounts with access"),
+        k3 = kpi(
+            "monitor",
+            "Active sessions",
+            sessions.to_string(),
+            "signed-in devices"
+        ),
+        k4 = kpi(
+            "drive",
+            "System DB",
+            html::bytes(stats.page_count * novadb_storage::page::PAGE_SIZE as u64),
+            "on-disk size"
+        ),
+        k5 = kpi(
+            "file",
+            "WAL",
+            html::bytes(stats.wal_bytes),
+            "write-ahead log"
+        ),
+        iact = html::icon("activity"),
+        iflag = html::icon("flag"),
+        c1 = check_row(vpill == "ok", "Integrity (full verify)", &vtext),
+        c2 = check_row(cpill == "ok", "Audit hash chain", &ctext),
+        pr = stats.page_reads,
+        pw = stats.page_writes,
+        cp = stats.checkpoints,
+        bp = stats.cache_pages,
+        bpb = html::bytes(stats.cache_pages as u64 * novadb_storage::page::PAGE_SIZE as u64),
+        total = stages.len(),
     );
     Ok(Html(html::page(
         "Overview",
@@ -1129,16 +1180,16 @@ async fn account_render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
         .map(|(k, s)| {
             let me = *k == c.key;
             let action = if me {
-                r#"<span class="pill ok">this device</span>"#.to_string()
+                r#"<span class="badge acc">This device</span>"#.to_string()
             } else {
                 format!(
-                    r#"<form method="post" action="/account/sessions/revoke">{}<input type="hidden" name="id" value="{}"><button class="ghost">Sign out</button></form>"#,
+                    r#"<form method="post" action="/account/sessions/revoke">{}<input type="hidden" name="id" value="{}"><button class="ghost sm">Sign out</button></form>"#,
                     csrf(&c.sess.csrf),
                     esc(&k[..12.min(k.len())])
                 )
             };
             format!(
-                "<tr><td class=mono>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{action}</td></tr>",
+                "<tr><td class=mono>{}</td><td>{}</td><td class=nw>{}</td><td class=nw>{}</td><td class=r>{action}</td></tr>",
                 esc(&s.ip),
                 esc(&clip(&s.ua, 60)),
                 html::ago(t, s.created),
@@ -1151,46 +1202,62 @@ async fn account_render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
         let linked = c.user.links.iter().find(|l| l.provider == p.kind.id());
         let cell = match linked {
             Some(l) => format!(
-                r#"<td>{} <span class="hint">(id {})</span></td><td><form method="post" action="/account/unlink">{}<input type="hidden" name="provider" value="{}"><button class="ghost">Unlink</button></form></td>"#,
+                r#"<td><span class="pill ok">Linked</span> {} <span class="hint">id {}</span></td><td class="r"><form method="post" action="/account/unlink">{}<input type="hidden" name="provider" value="{}"><button class="ghost sm">Unlink</button></form></td>"#,
                 esc(&l.name),
                 esc(&l.id),
                 csrf(&c.sess.csrf),
                 p.kind.id()
             ),
             None => format!(
-                r#"<td class="hint">not linked</td><td><form method="post" action="/oauth/{}/link">{}<button class="ghost">Link {}</button></form></td>"#,
+                r#"<td><span class="pill plain">Not linked</span></td><td class="r"><form method="post" action="/oauth/{}/link">{}<button class="ghost sm">Link {}</button></form></td>"#,
                 p.kind.id(),
                 csrf(&c.sess.csrf),
                 p.kind.label()
             ),
         };
-        lrows.push_str(&format!("<tr><td>{}</td>{cell}</tr>", p.kind.label()));
+        lrows.push_str(&format!(
+            "<tr><td><b>{}</b></td>{cell}</tr>",
+            p.kind.label()
+        ));
     }
     let links = if lrows.is_empty() {
-        r#"<p class="hint">Discord / GitHub sign-in is not configured on this server yet.</p>"#
+        r#"<div class="empty">Discord / GitHub sign-in is not configured on this server yet.</div>"#
             .to_string()
     } else {
         format!(
-            r#"<table>{lrows}</table><p class="hint">Linked logins let you skip the password, never the 2FA code.</p>"#
+            r#"<div class="tbl"><table><tbody>{lrows}</tbody></table></div><div class="card-f">Linked logins let you skip the password, never the 2FA code.</div>"#
         )
     };
     let body = format!(
-        r#"<h1>Account</h1><p class="sub">{} · role {}</p>
-<div class="cols"><div class="card"><h2>Change password</h2><form method="post" action="/account/password">{}
+        r#"{head}
+<div class="cols"><div class="card"><div class="card-h">{ikey}<h2>Change password</h2></div><div class="card-b"><form method="post" action="/account/password">{}
 <label>Current password</label><input type="password" name="current" autocomplete="current-password" required maxlength="128">
 <label>New password</label><input type="password" name="new" autocomplete="new-password" required minlength="12" maxlength="128">
 <label>Repeat new password</label><input type="password" name="again" autocomplete="new-password" required minlength="12" maxlength="128">
-<button>Change password</button></form><p class="hint">Changing it signs out your other devices.</p></div>
-<div class="card"><h2>Two-factor (TOTP)</h2><p><span class="pill ok">on</span> required for all accounts</p>
+<button>Update password</button></form></div><div class="card-f">Changing it signs out your other devices.</div></div>
+<div class="card"><div class="card-h">{iphone}<h2>Two-factor authentication</h2><span class="r badge ok">{icheck}Enabled</span></div><div class="card-b"><p class="sub">TOTP is required for every account. To move it to a new phone, confirm with your password and a current code.</p>
 <form method="post" action="/account/totp/reset">{}<label>Current password</label><input type="password" name="current" required maxlength="128">
-<label>Current 6-digit code</label><input type="text" name="code" inputmode="numeric" required maxlength="7">
-<button class="ghost" style="margin-top:14px">Move 2FA to a new device</button></form></div></div>
-<div class="card"><h2>Linked logins</h2>{links}</div>
-<div class="card"><h2>Active sessions</h2><table><tr><th>IP</th><th>Device</th><th>Started</th><th>Last seen</th><th></th></tr>{srows}</table></div>"#,
-        esc(&c.user.name),
-        c.user.role.name(),
+<label>Current 6-digit code</label><input type="text" name="code" inputmode="numeric" required maxlength="7" placeholder="000000">
+<button class="ghost">Move 2FA to a new device</button></form></div></div></div>
+<div class="card"><div class="card-h">{ilink}<h2>Linked logins</h2></div>{links}</div>
+<div class="card"><div class="card-h">{imon}<h2>Active sessions</h2><span class="r hint">{nsess} signed in</span></div><div class="tbl"><table><thead><tr><th>IP</th><th>Device</th><th>Started</th><th>Last seen</th><th></th></tr></thead><tbody>{srows}</tbody></table></div></div>"#,
         csrf(&c.sess.csrf),
         csrf(&c.sess.csrf),
+        head = html::header(
+            "Account",
+            &format!(
+                "{} · <span class=\"role\">{}</span>",
+                esc(&c.user.name),
+                c.user.role.name()
+            ),
+            ""
+        ),
+        ikey = html::icon("key"),
+        iphone = html::icon("phone"),
+        icheck = html::icon("check"),
+        ilink = html::icon("link"),
+        imon = html::icon("monitor"),
+        nsess = sessions.len(),
     );
     Ok(Html(html::page(
         "Account",
@@ -1392,32 +1459,32 @@ async fn users_render(app: &App, c: &Ctx, flash: Flash<'_>, reveal: Option<(&str
         .map(|u| {
             let mut status = Vec::new();
             if u.disabled {
-                status.push(r#"<span class="pill bad">disabled</span>"#.to_string());
+                status.push(r#"<span class="pill bad">Disabled</span>"#.to_string());
             }
             if u.locked_until > t {
-                status.push(r#"<span class="pill warn">locked</span>"#.to_string());
+                status.push(r#"<span class="pill warn">Locked</span>"#.to_string());
             }
             if u.must_change {
-                status.push(r#"<span class="pill warn">must change pw</span>"#.to_string());
+                status.push(r#"<span class="pill warn">Must change password</span>"#.to_string());
             }
             status.push(if u.totp.is_some() {
-                r#"<span class="pill ok">2FA</span>"#.to_string()
+                r#"<span class="pill ok">2FA on</span>"#.to_string()
             } else {
-                r#"<span class="pill warn">no 2FA yet</span>"#.to_string()
+                r#"<span class="pill warn">2FA pending</span>"#.to_string()
             });
             for l in &u.links {
-                status.push(format!(r#"<span class="pill">{}</span>"#, esc(&l.provider)));
+                status.push(format!(r#"<span class="pill plain">{}</span>"#, esc(&l.provider)));
             }
             let me = u.name == c.user.name;
             let btn = |action: &str, label: &str, cls: &str| {
                 format!(
-                    r#"<form method="post" action="/users/action">{}<input type="hidden" name="user" value="{}"><input type="hidden" name="action" value="{action}"><button class="ghost {cls}">{label}</button></form>"#,
+                    r#"<form method="post" action="/users/action">{}<input type="hidden" name="user" value="{}"><input type="hidden" name="action" value="{action}"><button class="{cls}">{label}</button></form>"#,
                     csrf(&c.sess.csrf),
                     esc(&u.name)
                 )
             };
             let actions = if me {
-                r#"<span class="hint">you (use Account)</span>"#.to_string()
+                r#"<a class="hint" href="/account">You · manage in Account</a>"#.to_string()
             } else {
                 let mut a = vec![
                     if u.disabled { btn("enable", "Enable", "") } else { btn("disable", "Disable", "") },
@@ -1427,17 +1494,27 @@ async fn users_render(app: &App, c: &Ctx, flash: Flash<'_>, reveal: Option<(&str
                 if u.locked_until > t {
                     a.push(btn("unlock", "Unlock", ""));
                 }
+                a.push(r#"<hr><div class="lbl">Change role</div>"#.to_string());
                 for r in [Role::Viewer, Role::Operator, Role::Admin] {
                     if r != u.role {
                         a.push(btn(&format!("role_{}", r.name()), &format!("Make {}", r.name()), ""));
                     }
                 }
-                a.push(btn("delete", "Delete", "danger"));
-                format!(r#"<div class="row">{}</div>"#, a.concat())
+                a.push("<hr>".to_string());
+                a.push(btn("delete", "Delete user", "danger"));
+                format!(
+                    r#"<details class="menu"><summary title="Manage {}" aria-label="Manage {}">{}</summary><div class="pop">{}</div></details>"#,
+                    esc(&u.name),
+                    esc(&u.name),
+                    html::icon("more"),
+                    a.concat()
+                )
             };
             format!(
-                "<tr><td><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{actions}</td></tr>",
+                "<tr><td><span class=ucell>{}<b>{}</b></span></td><td><span class=\"role {}\">{}</span></td><td>{}</td><td class=nw>{}</td><td class=r>{actions}</td></tr>",
+                html::avatar(&u.name),
                 esc(&u.name),
+                u.role.name(),
                 u.role.name(),
                 status.concat(),
                 html::ago(t, u.last_login)
@@ -1446,20 +1523,29 @@ async fn users_render(app: &App, c: &Ctx, flash: Flash<'_>, reveal: Option<(&str
         .collect();
     let reveal_html = match reveal {
         Some((who, pw)) => format!(
-            r#"<div class="card"><h2>One-time password for {}</h2><p>Give this to them over a private channel. It is shown only once; they must change it at first sign-in.</p><div class="secret">{}</div></div>"#,
+            r#"<div class="card reveal"><div class="card-h">{}<h2>One-time password for {}</h2></div><div class="card-b"><p class="sub">Send it over a private channel. It is shown only once; they must change it at first sign-in.</p><div class="secret">{}</div></div></div>"#,
+            html::icon("key"),
             esc(who),
             esc(pw)
         ),
         None => String::new(),
     };
     let body = format!(
-        r#"<h1>Users</h1><p class="sub">Every account needs a password + TOTP. New users get a one-time password.</p>{reveal_html}
-<div class="card"><table><tr><th>User</th><th>Role</th><th>Status</th><th>Last sign-in</th><th>Actions</th></tr>{rows}</table></div>
-<div class="card"><h2>Add user</h2><form method="post" action="/users/create" class="row">{}
-<input type="text" name="username" placeholder="username (a-z 0-9 . _ -)" required maxlength="32" style="max-width:280px">
-<select name="role" style="max-width:160px"><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select>
-<button>Create</button></form><p class="hint">viewer: overview · operator: + audit log · admin: + users</p></div>"#,
-        csrf(&c.sess.csrf)
+        r#"{head}{reveal_html}
+<div class="card"><div class="card-h">{iusers}<h2>Members</h2><span class="r hint">{n} accounts</span></div><div class="tbl"><table><thead><tr><th>User</th><th>Role</th><th>Status</th><th>Last sign-in</th><th class="r">Actions</th></tr></thead><tbody>{rows}</tbody></table></div></div>
+<div class="card"><div class="card-h">{iadd}<h2>Invite a user</h2></div><div class="card-b"><form method="post" action="/users/create" class="addform">{}
+<div><label for="nu">Username</label><input id="nu" type="text" name="username" placeholder="a-z 0-9 . _ -" required maxlength="32"></div>
+<div><label for="nr">Role</label><select id="nr" name="role"><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Admin</option></select></div>
+<button>{iadd}Create user</button></form></div><div class="card-f"><b>Viewer</b>: overview · <b>Operator</b>: + audit log · <b>Admin</b>: + user management</div></div>"#,
+        csrf(&c.sess.csrf),
+        head = html::header(
+            "Users",
+            "Every account needs a password and TOTP. New users get a one-time password.",
+            ""
+        ),
+        iusers = html::icon("users"),
+        iadd = html::icon("user-plus"),
+        n = users.len(),
     );
     Ok(Html(html::page("Users", Some(&c.nav("/users")), flash, &body)).into_response())
 }
@@ -1645,9 +1731,12 @@ async fn audit_page(
         .map_err(internal)?;
     let chain_html = match chain {
         Ok(n) => format!(
-            r#"<span class="pill ok">chain intact</span> {n} entries, each one hashed into the next"#
+            r#"<span class="badge ok"><span class="pulse"></span>Chain intact</span><span class="r hint">{n} entries, each hashed into the next</span>"#
         ),
-        Err(e) => format!(r#"<span class="pill bad">chain broken</span> {}"#, esc(&e)),
+        Err(e) => format!(
+            r#"<span class="badge bad"><span class="pulse"></span>Chain broken</span><span class="r hint">{}</span>"#,
+            esc(&e)
+        ),
     };
     let trs: String = rows
         .iter()
@@ -1658,7 +1747,7 @@ async fn audit_page(
                 ""
             };
             format!(
-                r#"<tr><td>{}</td><td class="mono">{}</td><td><b>{}</b></td><td class="mono">{}</td><td><span class="pill {cls}">{}</span></td><td>{}</td><td class="mono" title="{}">{}</td></tr>"#,
+                r#"<tr><td class="num">{}</td><td class="mono nw">{}</td><td><b>{}</b></td><td class="mono">{}</td><td><span class="pill {cls}">{}</span></td><td>{}</td><td class="mono" title="{}">{}</td></tr>"#,
                 e.seq,
                 html::ts(e.ts),
                 esc(&e.actor),
@@ -1671,8 +1760,14 @@ async fn audit_page(
         })
         .collect();
     let body = format!(
-        r#"<h1>Audit log</h1><p class="sub">Append-only. Last 300 events, newest first (UTC).</p><div class="card"><p>{chain_html}</p>
-<table><tr><th>#</th><th>Time</th><th>Who</th><th>IP</th><th>Event</th><th>Detail</th><th>Hash</th></tr>{trs}</table></div>"#
+        r#"{head}<div class="card"><div class="card-h">{ic}{chain_html}</div>
+<div class="tbl"><table><thead><tr><th>#</th><th>Time (UTC)</th><th>Who</th><th>IP</th><th>Event</th><th>Detail</th><th>Hash</th></tr></thead><tbody>{trs}</tbody></table></div></div>"#,
+        head = html::header(
+            "Audit log",
+            "Append-only and tamper-evident. Last 300 events, newest first.",
+            ""
+        ),
+        ic = html::icon("audit"),
     );
     Ok(Html(html::page(
         "Audit log",

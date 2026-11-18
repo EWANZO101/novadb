@@ -89,8 +89,8 @@ check("not right" in b, "wrong TOTP refused at enrolment")
 s, h, b = a.req("POST", "/setup/totp", {"csrf": tok, "code": totp(secret)})
 check(s == 303 and h["location"] == "/?ok=mfa", "TOTP enrolled")
 s, h, b = a.req("GET", "/")
-check(s == 200 and "System database" in b and "chain intact" not in b or "intact" in b, "overview renders")
-check("Integrity" in b and 'pill ok">ok' in b, "system DB verify ok")
+check(s == 200 and "System health" in b and "intact (" in b, "overview renders")
+check(re.search(r'st ok">.*?<b>Integrity \(full verify\)</b>.*?pill ok">Passing', b) is not None and "Failing" not in b, "system DB verify ok")
 
 # Users: create a viewer, check one-time password shown, escape check.
 s, h, b = a.req("GET", "/users"); tok = csrf(b)
@@ -136,7 +136,7 @@ check(s == 303 and h["location"] == "/", "admin full login with TOTP")
 
 # Audit chain + escaping.
 s, h, b = a2.req("GET", "/audit")
-check("chain intact" in b and "login.fail" in b and "mfa.enrolled" in b, "audit log has events, chain intact")
+check("Chain intact" in b and "login.fail" in b and "mfa.enrolled" in b, "audit log has events, chain intact")
 check("<script>" not in b, "no unescaped script in audit page")
 check(PW0 not in b and NEWPW not in b and secret not in b, "no passwords/secrets in audit log")
 
