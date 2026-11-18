@@ -41,6 +41,22 @@ pub enum Stmt {
         limit: Option<u64>,
     },
     ShowTables,
+    /// GRANT privs ON scope TO users [WITH GRANT OPTION]; `table` None = global (*.*).
+    /// `privs` == u64::MAX means ALL PRIVILEGES (resolved by scope).
+    Grant {
+        privs: u64,
+        table: Option<String>,
+        users: Vec<String>,
+        grant_option: bool,
+    },
+    /// REVOKE privs [, GRANT OPTION] ON scope FROM users.
+    Revoke {
+        privs: u64,
+        table: Option<String>,
+        users: Vec<String>,
+        grant_option: bool,
+    },
+    ShowGrants(Option<String>),
     /// BACKUP DATABASE TO 'name' — handled by the server (root only, into <data>/backups).
     Backup(String),
     /// SHOW [FULL] PROCESSLIST — handled by the server.

@@ -25,6 +25,7 @@ pub mod exec;
 pub mod lexer;
 pub mod mvcc;
 pub mod parser;
+pub mod privs;
 pub mod query;
 pub mod value;
 

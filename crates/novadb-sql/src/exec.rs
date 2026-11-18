@@ -17,6 +17,7 @@ use crate::codec::{key_encode, prefix_end, row_decode, row_encode};
 use crate::error::{Result, SqlError};
 use crate::mvcc::{self, Mv, TS_LEN, WriteSet};
 use crate::parser::parse;
+use crate::privs;
 use crate::value::{ArithOp, ColType, Value, arith, coerce, compare, like, sort_cmp};
 
 /// Max rows a statement may hold in memory (sorting, UPDATE/DELETE candidate sets, results).
@@ -109,6 +110,8 @@ pub struct Engine {
     pending: HashSet<(Tree, Vec<u8>)>,
     /// Binary log (point-in-time recovery), if enabled.
     binlog: Option<Binlog>,
+    /// Enforce GRANTs (server); embedded use is trusted.
+    enforce: bool,
 }
 
 fn system_now() -> i64 {
@@ -129,6 +132,7 @@ impl Engine {
             manual: HashSet::new(),
             pending: HashSet::new(),
             binlog: None,
+            enforce: false,
         })
     }
     pub fn open_vfs(vfs: Box<dyn Vfs>, opts: Options) -> Result<Engine> {
@@ -141,6 +145,7 @@ impl Engine {
             manual: HashSet::new(),
             pending: HashSet::new(),
             binlog: None,
+            enforce: false,
         })
     }
     /// Replace the clock used by NOW()/CURRENT_TIMESTAMP (tests).
@@ -307,6 +312,10 @@ impl Engine {
                 }
             }
         }
+        if self.enforce {
+            let user = sess.user.clone();
+            self.authorize(s, &user)?;
+        }
         set_deadline(match s {
             Stmt::Select(_) if sess.max_execution_ms > 0 => Some(
                 std::time::Instant::now() + std::time::Duration::from_millis(sess.max_execution_ms),
@@ -354,7 +363,34 @@ impl Engine {
             Stmt::CreateUser { .. } | Stmt::AlterUser { .. } | Stmt::DropUser { .. } => {
                 self.commit_txn(conn)?;
                 let r = self.user_stmt(s)?;
+                if let Stmt::DropUser { names, .. } = s {
+                    for n in names {
+                        privs::drop_user(&mut self.db, n)?;
+                    }
+                }
                 self.log_after(s)?;
+                Ok(r)
+            }
+            Stmt::Grant { .. } | Stmt::Revoke { .. } => {
+                self.commit_txn(conn)?;
+                let r = self.grant_stmt(s, &sess.user)?;
+                if let Some(sql) = Self::grant_log_text(s) {
+                    self.log_now(vec![LogOp::Ddl(sql)])?;
+                }
+                Ok(r)
+            }
+            Stmt::ShowGrants(_) => self.grant_stmt(s, &sess.user),
+            Stmt::ShowTables if self.enforce && !privs::is_root(&sess.user) => {
+                let mut r = self.exec_stmt(s, conn)?;
+                let user = sess.user.clone();
+                let mut kept = Vec::new();
+                for row in r.rows {
+                    let name = row.first().and_then(Value::text).unwrap_or_default();
+                    if privs::effective(&mut self.db, &user, Some(&name))? & privs::TABLE_ALL != 0 {
+                        kept.push(row);
+                    }
+                }
+                r.rows = kept;
                 Ok(r)
             }
             Stmt::CreateTable(_)
@@ -606,6 +642,9 @@ fn run_stmt(mv: &mut Mv<'_, '_>, s: &Stmt, now: i64) -> Result<QueryResult> {
             }
             insert(mv, table, cols.as_deref(), &rows, now)
         }
+        Stmt::Grant { .. } | Stmt::Revoke { .. } | Stmt::ShowGrants(_) => Err(SqlError::internal(
+            "grant statements run through Engine::run_in",
+        )),
         Stmt::Kill { .. } | Stmt::ShowProcesslist | Stmt::Backup(_) => Err(SqlError::unsupported(
             "KILL / SHOW PROCESSLIST outside the server",
         )),
@@ -3172,4 +3211,354 @@ pub fn sql_value(v: &Value) -> String {
 /// Backtick-quoted identifier (dumps).
 pub fn sql_ident(n: &str) -> String {
     quote(n)
+}
+
+// ----- privileges ------------------------------------------------------------------------
+
+/// Tables read by a SELECT, including its subqueries.
+fn select_tables(sel: &Select, out: &mut Vec<String>) {
+    if let Some(f) = &sel.from {
+        out.push(f.clone());
+    }
+    for j in &sel.joins {
+        out.push(j.table.clone());
+    }
+    let mut copy = sel.clone();
+    let mut subs: Vec<Select> = Vec::new();
+    walk_select_mut(&mut copy, &mut |e| match e {
+        Expr::Subquery(s) | Expr::Exists { sub: s, .. } | Expr::InSubquery { sub: s, .. } => {
+            subs.push((**s).clone())
+        }
+        _ => {}
+    });
+    for s in &subs {
+        select_tables(s, out);
+    }
+}
+
+fn expr_subquery_tables(e: &Expr, out: &mut Vec<String>) {
+    let mut copy = e.clone();
+    let mut subs: Vec<Select> = Vec::new();
+    walk_expr_mut(&mut copy, &mut |x| match x {
+        Expr::Subquery(s) | Expr::Exists { sub: s, .. } | Expr::InSubquery { sub: s, .. } => {
+            subs.push((**s).clone())
+        }
+        _ => {}
+    });
+    for s in &subs {
+        select_tables(s, out);
+    }
+}
+
+fn resolve_mask(privs: u64, table: Option<&str>) -> Result<u64> {
+    let full = if table.is_some() {
+        privs::TABLE_ALL
+    } else {
+        privs::GLOBAL_ALL
+    };
+    let m = if privs == u64::MAX { full } else { privs };
+    if table.is_some() && m & !privs::TABLE_ALL != 0 {
+        let mut e = SqlError::internal(
+            "Illegal GRANT/REVOKE command; CREATE USER, PROCESS and SUPER are global (use ON *.*)",
+        );
+        e.code = 1144;
+        e.state = "42000";
+        return Err(e);
+    }
+    Ok(m)
+}
+
+fn scope_sql(table: Option<&str>) -> String {
+    table.map_or_else(|| "*.*".to_string(), |t| format!("`novadb`.{}", quote(t)))
+}
+
+impl Engine {
+    /// Enforce GRANTs (the server does; embedded users of the engine are trusted).
+    pub fn with_privileges(mut self) -> Self {
+        self.enforce = true;
+        self
+    }
+
+    /// Does `user` hold global privilege `p`? (root: always)
+    pub fn has_global(&mut self, user: &str, p: u64) -> Result<bool> {
+        Ok(privs::effective(&mut self.db, user, None)? & p != 0)
+    }
+
+    /// All grants (user, scope, mask) — backups.
+    pub fn grants(&mut self) -> Result<Vec<(String, String, u64)>> {
+        privs::all(&mut self.db)
+    }
+
+    /// Set a grant directly (restore).
+    pub fn set_grant(&mut self, user: &str, scope: &str, mask: u64) -> Result<()> {
+        privs::set(
+            &mut self.db,
+            user,
+            if scope == "*" { None } else { Some(scope) },
+            mask,
+        )
+    }
+
+    fn need(&mut self, user: &str, p: u64, table: &str) -> Result<()> {
+        if privs::effective(&mut self.db, user, Some(table))? & p == 0 {
+            return Err(privs::denied_table(p, user, table));
+        }
+        Ok(())
+    }
+
+    fn need_global(&mut self, user: &str, p: u64) -> Result<()> {
+        if privs::effective(&mut self.db, user, None)? & p == 0 {
+            return Err(privs::denied_global(p));
+        }
+        Ok(())
+    }
+
+    /// Check that `user` may run `s`.
+    fn authorize(&mut self, s: &Stmt, user: &str) -> Result<()> {
+        if privs::is_root(user) {
+            return Ok(());
+        }
+        match s {
+            Stmt::Select(sel) => {
+                let mut ts = Vec::new();
+                select_tables(sel, &mut ts);
+                for t in ts {
+                    self.need(user, privs::SELECT, &t)?;
+                }
+            }
+            Stmt::Explain(inner) => self.authorize(inner, user)?,
+            Stmt::Insert {
+                table,
+                rows,
+                select,
+                ..
+            } => {
+                self.need(user, privs::INSERT, table)?;
+                let mut ts = Vec::new();
+                if let Some(sel) = select {
+                    select_tables(sel, &mut ts);
+                }
+                for r in rows {
+                    for e in r {
+                        expr_subquery_tables(e, &mut ts);
+                    }
+                }
+                for t in ts {
+                    self.need(user, privs::SELECT, &t)?;
+                }
+            }
+            Stmt::Update {
+                table,
+                sets,
+                filter,
+                ..
+            } => {
+                self.need(user, privs::UPDATE, table)?;
+                self.need(user, privs::SELECT, table)?;
+                let mut ts = Vec::new();
+                for (_, e) in sets {
+                    expr_subquery_tables(e, &mut ts);
+                }
+                if let Some(f) = filter {
+                    expr_subquery_tables(f, &mut ts);
+                }
+                for t in ts {
+                    self.need(user, privs::SELECT, &t)?;
+                }
+            }
+            Stmt::Delete { table, filter, .. } => {
+                self.need(user, privs::DELETE, table)?;
+                self.need(user, privs::SELECT, table)?;
+                let mut ts = Vec::new();
+                if let Some(f) = filter {
+                    expr_subquery_tables(f, &mut ts);
+                }
+                for t in ts {
+                    self.need(user, privs::SELECT, &t)?;
+                }
+            }
+            Stmt::CreateTable(c) => self.need(user, privs::CREATE, &c.name)?,
+            Stmt::DropTable { names, .. } => {
+                for n in names {
+                    self.need(user, privs::DROP, n)?;
+                }
+            }
+            Stmt::CreateIndex { table, .. } | Stmt::DropIndex { table, .. } => {
+                self.need(user, privs::INDEX, table)?
+            }
+            Stmt::Describe(t) | Stmt::ShowCreateTable(t) => self.need(user, privs::TABLE_ALL, t)?,
+            Stmt::CreateUser { .. } | Stmt::DropUser { .. } => {
+                self.need_global(user, privs::CREATE_USER)?
+            }
+            Stmt::AlterUser { name, .. } => {
+                if !name.eq_ignore_ascii_case(user) {
+                    self.need_global(user, privs::CREATE_USER)?;
+                }
+            }
+            Stmt::Grant {
+                privs: p, table, ..
+            }
+            | Stmt::Revoke {
+                privs: p, table, ..
+            } => {
+                let eff = privs::effective(&mut self.db, user, table.as_deref())?;
+                if eff & privs::GRANT_OPTION == 0 {
+                    return Err(privs::denied_global(privs::GRANT_OPTION));
+                }
+                let want = resolve_mask(*p, table.as_deref())?;
+                let missing = want & !eff;
+                if missing != 0 {
+                    // Report the first missing privilege.
+                    return Err(privs::denied_global(missing & missing.wrapping_neg()));
+                }
+            }
+            Stmt::ShowGrants(Some(other)) if !other.eq_ignore_ascii_case(user) => {
+                self.need_global(user, privs::CREATE_USER)?
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn grant_stmt(&mut self, s: &Stmt, sess_user: &str) -> Result<QueryResult> {
+        match s {
+            Stmt::Grant {
+                privs: p,
+                table,
+                users,
+                grant_option,
+            }
+            | Stmt::Revoke {
+                privs: p,
+                table,
+                users,
+                grant_option,
+            } => {
+                let granting = matches!(s, Stmt::Grant { .. });
+                let t = table.as_deref();
+                if let Some(t) = t {
+                    let mut tx = self.db.begin()?;
+                    let found = find_table(&mut tx, t);
+                    tx.rollback();
+                    if found?.is_none() {
+                        return Err(SqlError::no_table(t));
+                    }
+                }
+                let mut mask = resolve_mask(*p, t)?;
+                if *grant_option {
+                    mask |= privs::GRANT_OPTION;
+                }
+                for u in users {
+                    if privs::is_root(u) {
+                        continue; // root always has everything
+                    }
+                    if self.user_hash(u)?.is_none() {
+                        let mut e = SqlError::internal(format!(
+                            "User '{u}' does not exist (CREATE USER first)"
+                        ));
+                        e.code = 1410;
+                        e.state = "42000";
+                        return Err(e);
+                    }
+                    let old = privs::get(&mut self.db, u, t)?;
+                    let new = if granting { old | mask } else { old & !mask };
+                    privs::set(&mut self.db, u, t, new)?;
+                }
+                Ok(QueryResult::ok(0))
+            }
+            Stmt::ShowGrants(who) => {
+                let u = who.clone().unwrap_or_else(|| sess_user.to_string());
+                let mut rows = Vec::new();
+                let all: Vec<(String, String, u64)> = if privs::is_root(&u) {
+                    vec![(
+                        u.clone(),
+                        "*".into(),
+                        privs::GLOBAL_ALL | privs::GRANT_OPTION,
+                    )]
+                } else {
+                    privs::all(&mut self.db)?
+                        .into_iter()
+                        .filter(|(x, _, _)| x.eq_ignore_ascii_case(&u))
+                        .collect()
+                };
+                if !all.iter().any(|(_, s, _)| s == "*") {
+                    rows.push(vec![Value::Str(format!("GRANT USAGE ON *.* TO `{u}`@`%`"))]);
+                }
+                for (_, scope, mask) in all {
+                    let global = scope == "*";
+                    let line = format!(
+                        "GRANT {} ON {} TO `{u}`@`%`{}",
+                        privs::names(mask, global),
+                        scope_sql(if global { None } else { Some(scope.as_str()) }),
+                        if mask & privs::GRANT_OPTION != 0 {
+                            " WITH GRANT OPTION"
+                        } else {
+                            ""
+                        }
+                    );
+                    rows.push(vec![Value::Str(line)]);
+                }
+                Ok(QueryResult {
+                    columns: meta(&[&format!("Grants for {u}@%")]),
+                    rows,
+                    ..Default::default()
+                })
+            }
+            _ => Err(SqlError::internal("not a grant statement")),
+        }
+    }
+
+    fn grant_log_text(s: &Stmt) -> Option<String> {
+        match s {
+            Stmt::Grant {
+                privs: p,
+                table,
+                users,
+                grant_option,
+            }
+            | Stmt::Revoke {
+                privs: p,
+                table,
+                users,
+                grant_option,
+            } => {
+                let granting = matches!(s, Stmt::Grant { .. });
+                let global = table.is_none();
+                let mut list = if *p == u64::MAX {
+                    "ALL PRIVILEGES".to_string()
+                } else {
+                    privs::names(*p, global)
+                };
+                if !granting && *grant_option {
+                    list = if *p == 0 {
+                        "GRANT OPTION".into()
+                    } else {
+                        format!("{list}, GRANT OPTION")
+                    };
+                }
+                let who = users
+                    .iter()
+                    .map(|u| quote(u))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(if granting {
+                    format!(
+                        "GRANT {list} ON {} TO {who}{}",
+                        scope_sql(table.as_deref()),
+                        if *grant_option {
+                            " WITH GRANT OPTION"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    format!(
+                        "REVOKE {list} ON {} FROM {who}",
+                        scope_sql(table.as_deref())
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
 }

@@ -32,7 +32,8 @@ only that name; `SHOW DATABASES` lists it).
 | Pre-auth DoS | Packets > 64 KiB before login close the connection (nothing allocated from client lengths beyond that); the whole handshake must finish in 10 s; max 32 connections per IP and 256 total (`ERROR 1040`) (PLAN §4.6). |
 | After login | `max_allowed_packet` 64 MiB, statements ≤ 16 MiB (parser limit), idle connections closed after 8 h, ≤ 1024 prepared statements per connection, long data ≤ 16 MiB per parameter. |
 | Users | `CREATE USER [IF NOT EXISTS] 'u'@'host' IDENTIFIED BY '…'`, `ALTER USER … IDENTIFIED BY`, `DROP USER [IF EXISTS]` (the last user cannot be dropped). Passwords 12–128 characters. The host part is accepted but ignored (the server listens on loopback by default). |
-| Not yet | **No privileges**: every user can do everything (GRANT arrives with roles in a later stage). No `mysql_clear_password`, no RSA key exchange (TLS covers it), no client certificates. |
+| Privileges | Least privilege by default; `GRANT/REVOKE/SHOW GRANTS` (table + global, grant option). `root` always has everything. KILL others needs SUPER, full PROCESSLIST needs PROCESS. |
+| Not yet | No `mysql_clear_password`, no RSA key exchange (TLS covers it), no client certificates, no roles. |
 | Logging | Failed / rate-limited logins are logged with user and IP; passwords never are. |
 
 ## Protocol coverage

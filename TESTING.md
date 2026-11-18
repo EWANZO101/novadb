@@ -5,6 +5,16 @@ All builds and tests run **inside Docker** (`novadb-builder`, `--cpus 2 --memory
 Toolchain: rustc 1.100.0 stable, nightly 2026-11-11 for cargo-fuzz; cargo-deny 0.20.2,
 cargo-audit 0.23.0, cargo-nextest 0.9.152.
 
+## 2026-11-18 — Privileges (GRANT / REVOKE, least privilege)
+From the owner's MySQL-pitfalls list ([docs/mysql-pitfalls.md](docs/mysql-pitfalls.md)).
+
+| check | result |
+|---|---|
+| `tests/privs.rs`: new user denied everything (1142/1227), no table names leak, table-level grants, joins/subqueries/INSERT…SELECT all checked, revoke, global ALL, global-only privs refused on tables (1144), DROP USER clears grants, grant to unknown user (1410), own-password change only, GRANT OPTION delegation limited to the grantor's privileges | ✅ 2/2 |
+| real server + mariadb client: SELECT denied (1142), BACKUP denied (1227 SUPER), GRANT → allowed, SHOW GRANTS | ✅ |
+| Node `mysql2` regression 20/20, transactions 11/11, Stage 6 7/7 | ✅ |
+| grants included in backups and the binary log (replayed on restore) | ✅ |
+
 ## 2026-11-18 — Stage 7 (operations: backups, binlog, PITR, metrics, packaging)
 Details: [docs/operations.md](docs/operations.md), [docs/mysql-pitfalls.md](docs/mysql-pitfalls.md).
 New deps: chacha20poly1305, getrandom (RustCrypto / permissive).

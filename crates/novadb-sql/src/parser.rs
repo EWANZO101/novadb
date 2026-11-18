@@ -341,8 +341,124 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Privilege list of GRANT/REVOKE. Returns (mask, saw GRANT OPTION).
+    fn priv_list(&mut self) -> Result<(u64, bool)> {
+        let mut mask = 0u64;
+        let mut grant_opt = false;
+        loop {
+            let word = match self.bump() {
+                Tok::Ident(w) => w.to_ascii_lowercase(),
+                _ => {
+                    self.i -= 1;
+                    return Err(self.err("expected a privilege name"));
+                }
+            };
+            match word.as_str() {
+                "all" => {
+                    let _ = self.eat_kw("privileges");
+                    mask = u64::MAX;
+                }
+                "usage" => {}
+                "select" => mask |= crate::privs::SELECT,
+                "insert" => mask |= crate::privs::INSERT,
+                "update" => mask |= crate::privs::UPDATE,
+                "delete" => mask |= crate::privs::DELETE,
+                "drop" => mask |= crate::privs::DROP,
+                "index" => mask |= crate::privs::INDEX,
+                "alter" => mask |= crate::privs::ALTER,
+                "process" => mask |= crate::privs::PROCESS,
+                "super" | "backup_admin" | "connection_admin" => mask |= crate::privs::SUPER,
+                "create" => {
+                    if self.eat_kw("user") {
+                        mask |= crate::privs::CREATE_USER;
+                    } else {
+                        mask |= crate::privs::CREATE;
+                    }
+                }
+                "grant" => {
+                    self.kw("option")?;
+                    grant_opt = true;
+                }
+                other => {
+                    return Err(SqlError::unsupported(&format!(
+                        "privilege {}",
+                        other.to_uppercase()
+                    )));
+                }
+            }
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        Ok((mask, grant_opt))
+    }
+
+    /// `*.*` | `*` | `novadb.*` | `[novadb.]table` → None (global) or Some(table).
+    fn grant_target(&mut self) -> Result<Option<String>> {
+        if self.eat_sym("*") {
+            if self.eat_sym(".") {
+                self.sym("*")?;
+            }
+            return Ok(None);
+        }
+        let first = self.ident()?;
+        if self.eat_sym(".") {
+            if !first.eq_ignore_ascii_case("novadb") {
+                return Err(SqlError::unknown_db(&first));
+            }
+            if self.eat_sym("*") {
+                return Ok(None);
+            }
+            return Ok(Some(self.ident()?));
+        }
+        Ok(Some(first))
+    }
+
     fn statement(&mut self) -> Result<Stmt> {
         self.refuse_file_and_code_features()?;
+        if self.eat_kw("grant") {
+            let (privs, _) = self.priv_list()?;
+            self.kw("on")?;
+            let _ = self.eat_kw("table");
+            let table = self.grant_target()?;
+            self.kw("to")?;
+            let mut users = vec![self.user_spec()?];
+            while self.eat_sym(",") {
+                users.push(self.user_spec()?);
+            }
+            let grant_option = if self.eat_kw("with") {
+                self.kw("grant")?;
+                self.kw("option")?;
+                true
+            } else {
+                false
+            };
+            return Ok(Stmt::Grant {
+                privs,
+                table,
+                users,
+                grant_option,
+            });
+        }
+        if self.eat_kw("revoke") {
+            let (privs, grant_option) = self.priv_list()?;
+            self.kw("on")?;
+            let _ = self.eat_kw("table");
+            let table = self.grant_target()?;
+            if !self.eat_kw("from") {
+                return Err(self.err("expected FROM"));
+            }
+            let mut users = vec![self.user_spec()?];
+            while self.eat_sym(",") {
+                users.push(self.user_spec()?);
+            }
+            return Ok(Stmt::Revoke {
+                privs,
+                table,
+                users,
+                grant_option,
+            });
+        }
         if self.eat_kw("backup") {
             let _ = self.eat_kw("database");
             self.kw("to")?;
@@ -442,6 +558,19 @@ impl<'a> Parser<'a> {
             }
             if self.eat_kw("processlist") {
                 return Ok(Stmt::ShowProcesslist);
+            }
+            if self.eat_kw("grants") {
+                if self.eat_kw("for") {
+                    if self.is_kw("current_user") {
+                        self.i += 1;
+                        if self.eat_sym("(") {
+                            self.sym(")")?;
+                        }
+                        return Ok(Stmt::ShowGrants(None));
+                    }
+                    return Ok(Stmt::ShowGrants(Some(self.user_spec()?)));
+                }
+                return Ok(Stmt::ShowGrants(None));
             }
             if self.eat_kw("warnings") || self.eat_kw("errors") {
                 return Ok(Stmt::ShowWarnings);

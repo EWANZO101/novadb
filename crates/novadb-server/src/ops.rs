@@ -79,11 +79,12 @@ fn valid_backup_name(n: &str) -> bool {
 /// BACKUP DATABASE TO 'name': consistent snapshot, written in batches so the engine lock is
 /// released between them (writers keep working). Root only; files live in <data>/backups.
 pub async fn backup(server: &Arc<Server>, user: &str, name: &str) -> Result<QueryResult, SqlError> {
-    if !user.eq_ignore_ascii_case("root") {
-        let mut e = SqlError::internal("Access denied; you need root to run BACKUP");
-        e.code = 1227;
-        e.state = "42000";
-        return Err(e);
+    let allowed = {
+        let mut e = lock(server)?;
+        e.has_global(user, novadb_sql::privs::SUPER)?
+    };
+    if !allowed {
+        return Err(novadb_sql::privs::denied_global(novadb_sql::privs::SUPER));
     }
     if !valid_backup_name(name) {
         return Err(SqlError::internal(
@@ -107,7 +108,7 @@ pub async fn backup(server: &Arc<Server>, user: &str, name: &str) -> Result<Quer
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
-        let (snap, users, tables) = {
+        let (snap, users, tables, grants) = {
             let mut e = lock(&srv)?;
             let snap = e.dump_begin(conn)?;
             let users: Vec<(String, String)> = e
@@ -116,11 +117,15 @@ pub async fn backup(server: &Arc<Server>, user: &str, name: &str) -> Result<Quer
                 .filter_map(|u| e.user_hash(&u).ok().flatten().map(|h| (u, h)))
                 .collect();
             let tables = e.dump_tables()?;
-            (snap, users, tables)
+            let grants = e.grants()?;
+            (snap, users, tables, grants)
         };
         let out = (|| {
             let mut w = BackupWriter::create(&p2, Some(srv.backup_key))?;
             backup::write_header(&mut w, snap, wall, &users)?;
+            for (u, scope, mask) in &grants {
+                w.item(&format!("-- novadb:grant {mask} {scope} {u}"))?;
+            }
             for (name, ddl, ai) in &tables {
                 w.item(ddl)?;
                 let mut after: Option<Vec<u8>> = None;

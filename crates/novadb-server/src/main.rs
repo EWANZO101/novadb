@@ -139,6 +139,17 @@ impl Server {
         .unwrap_or(false)
     }
 
+    /// Global privilege check (blocking engine lock; used for KILL / PROCESSLIST).
+    fn has_global(&self, user: &str, p: u64) -> bool {
+        novadb_sql::privs::is_root(user)
+            || self
+                .engine
+                .lock()
+                .ok()
+                .and_then(|mut e| e.has_global(user, p).ok())
+                .unwrap_or(false)
+    }
+
     fn conn(&self, id: u32) -> Option<Arc<ConnInfo>> {
         self.conns.lock().ok().and_then(|m| m.get(&id).cloned())
     }
@@ -163,7 +174,7 @@ impl Server {
             e.code = 1094;
             return Err(e);
         };
-        if !by.eq_ignore_ascii_case("root") && !t.user.eq_ignore_ascii_case(by) {
+        if !t.user.eq_ignore_ascii_case(by) && !self.has_global(by, novadb_sql::privs::SUPER) {
             let mut e = SqlError::internal(format!("You are not owner of thread {id}"));
             e.code = 1095;
             return Err(e);
@@ -176,13 +187,14 @@ impl Server {
     }
 
     fn processlist(&self, by: &str) -> QueryResult {
+        let see_all = self.has_global(by, novadb_sql::privs::PROCESS);
         let mut rows = Vec::new();
         if let Ok(m) = self.conns.lock() {
             let mut ids: Vec<&u32> = m.keys().collect();
             ids.sort();
             for id in ids {
                 let c = &m[id];
-                if !by.eq_ignore_ascii_case("root") && !c.user.eq_ignore_ascii_case(by) {
+                if !see_all && !c.user.eq_ignore_ascii_case(by) {
                     continue;
                 }
                 let info = c.info.lock().ok().and_then(|i| i.clone());
@@ -479,7 +491,8 @@ fn run(cfg: Config) -> Result<(), String> {
     let backup_key = ops::load_or_create_key(&cfg.data_dir, cfg.backup_key.as_deref())?;
     let mut engine = Engine::open(cfg.data_dir.join("db"))
         .map_err(|e| e.to_string())?
-        .with_password_hasher(auth::hash_password);
+        .with_password_hasher(auth::hash_password)
+        .with_privileges();
     if !cfg.no_binlog {
         // Encrypted binary log for point-in-time recovery.
         engine = engine

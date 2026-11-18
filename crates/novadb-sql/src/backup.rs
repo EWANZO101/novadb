@@ -274,6 +274,9 @@ pub fn dump(
             .filter_map(|u| e.user_hash(&u).ok().flatten().map(|h| (u, h)))
             .collect();
         write_header(&mut w, snap, wall_us, &users)?;
+        for (u, scope, mask) in e.grants()? {
+            w.item(&format!("-- novadb:grant {mask} {scope} {u}"))?;
+        }
         for (name, ddl, ai) in e.dump_tables()? {
             w.item(&ddl)?;
             let mut after: Option<Vec<u8>> = None;
@@ -310,6 +313,15 @@ pub fn restore(e: &mut Engine, path: &Path, key: Option<&[u8; 32]>) -> Result<u6
                     snap = rest.split(' ').next().and_then(|t| t.parse().ok());
                 }
                 (Some("user"), Some(hash), Some(name)) => e.set_user_hash(name, hash)?,
+                (Some("grant"), Some(mask), Some(rest)) => {
+                    let mask: u64 = mask
+                        .parse()
+                        .map_err(|_| SqlError::corrupt("backup: bad grant"))?;
+                    let (scope, user) = rest
+                        .split_once(' ')
+                        .ok_or_else(|| SqlError::corrupt("backup: bad grant"))?;
+                    e.set_grant(user, scope, mask)?;
+                }
                 (Some("autoinc"), Some(n), Some(table)) => {
                     let n: u64 = n
                         .parse()
