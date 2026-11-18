@@ -26,7 +26,7 @@ Requested by the owner on 2026-11-18; keep this list current as stages land.
 | Storage-engine fragmentation (MyISAM vs InnoDB) | One engine; every table is transactional and crash-safe. | ✅ |
 | Painful schema changes on big tables (`gh-ost`, `pt-osc`) | **Built-in online `ALTER TABLE`**: renames, defaults, DROP INDEX, adding a nullable column, widening are *instant* (catalog only); everything else (drop/reorder columns, type changes, ADD INDEX, NOT NULL) is an *online rebuild* — batches copied into a hidden shadow table, concurrent changes re-applied, then an atomic swap; other sessions keep reading and writing. Interrupted/crashed ALTERs leave the table untouched. See [alter.md](alter.md). | ✅ |
 | Concurrency / locking bottlenecks | MVCC snapshot isolation: readers never block, no row locks, no deadlocks, conflicts → 1213 retry. | ✅ |
-| Replication lag / stale replicas | **Stage 8:** Raft — a commit is acknowledged only after a quorum has it; reads can be linearizable. | 🟡 Stage 8 |
+| Replication lag / stale replicas | **Raft cluster**: a commit is acknowledged only after a majority stored it; failover elects a node that has every acknowledged write; `--linearizable-reads` (ReadIndex) for reads that never miss an acknowledged write. No async replicas, no split brain. See [cluster.md](cluster.md). | ✅ |
 | Single-node writes, no sharding | Stage 8 gives a replicated cluster (still one leader). Sharding is a later project. | ⏳ |
 | Single-threaded queries | Planned: parallel scans / aggregation. | ⏳ |
 | Weak optimizer, manual index hints | Planner never changes results (differential tests); index nested-loop joins. Cost-based join ordering / statistics planned. | 🟡 |

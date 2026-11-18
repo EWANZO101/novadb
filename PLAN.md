@@ -37,7 +37,7 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 - ✅ **Stage 5 — transactions**: MVCC, BEGIN/COMMIT/ROLLBACK, deadlock detection, group commit, isolation tests. *(Snapshot isolation, first-committer-wins → 1213; no row locks so no deadlocks — docs/transactions.md.)*
 - ✅ **Stage 6 — joins/aggregates/planner**: JOIN, GROUP BY, HAVING, subqueries, cost-based index selection, query timeout/cancel (KILL). *(Done except cost-based selection: rule-based index choice + index nested-loop joins, no join reordering yet — docs/sql.md.)*
 - ✅ **Stage 7 — ops**: Docker image, systemd unit, backup/restore + PITR, Prometheus metrics.
-- ⏳ **Stage 8 — replication/cluster (custom Raft)**: 3-node, leader election, log replication, join tokens, mTLS, partition tests (Jepsen-style).
+- ✅ **Stage 8 — replication/cluster (custom Raft)**: leader election (PreVote, CheckQuorum), log replication, ReadIndex reads, snapshots, membership changes, join tokens, mTLS, deterministic partition/crash simulation + 3-node container tests ([docs/cluster.md](docs/cluster.md)).
 - 🟡 **Stage 9 — Control dashboard + Identity** (Argon2id, TOTP, passkeys, Discord/GitHub OAuth, audit log). *(Live at the dashboard; passkeys not done yet — docs/dashboard.md.)*
 - ✅ **Stage 10 — REST/WebSocket + SDKs**: token-scoped REST CRUD, saved queries, opt-in SQL, WebSocket queries/transactions/live change feed, JS + Python SDKs ([docs/rest.md](docs/rest.md)). Website: later.
 **Later / separate project**: Windows installer, Kubernetes/Helm, NovaDB Cloud + billing, stored procedures, triggers, LSM engine.

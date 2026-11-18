@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+novadb-raft = { path = "../novadb-raft" }
 novadb-storage.workspace = true
 novadb-protocol.workspace = true
 novadb-sql.workspace = true

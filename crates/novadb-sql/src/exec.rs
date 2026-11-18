@@ -20,7 +20,10 @@ use crate::parser::parse;
 use crate::privs;
 
 mod alter;
+mod cluster;
+
 use crate::value::{ArithOp, ColType, Value, arith, coerce, compare, like, sort_cmp};
+pub use cluster::Captured;
 
 /// Max rows a statement may hold in memory (sorting, UPDATE/DELETE candidate sets, results).
 /// Disk spill for sorts arrives with the planner (Stage 6); until then this is a hard cap.
@@ -122,6 +125,9 @@ pub struct Engine {
     alter: Option<alter::Job>,
     /// Called with the logical changes of every durable commit (change feeds).
     hook: Option<ChangeHook>,
+    /// Cluster: running a statement in capture mode / applying a committed entry.
+    capturing: bool,
+    applying: bool,
 }
 
 /// Receives the logical changes (rows put/deleted, DDL text, …) of each durable commit.
@@ -178,6 +184,8 @@ impl Engine {
             deferred: None,
             alter: None,
             hook: None,
+            capturing: false,
+            applying: false,
         })
         .after_open()
     }
@@ -196,6 +204,8 @@ impl Engine {
             deferred: None,
             alter: None,
             hook: None,
+            capturing: false,
+            applying: false,
         })
         .after_open()
     }
@@ -385,7 +395,7 @@ impl Engine {
         if self.ddl_owner.is_some_and(|o| o != conn) {
             return Err(ddl_busy());
         }
-        if self.enforce {
+        if self.enforce && !self.applying {
             let user = sess.user.clone();
             self.authorize(s, &user)?;
         }
@@ -478,6 +488,16 @@ impl Engine {
                 let transactional = self.ddl_owner == Some(conn)
                     || self.txns.contains_key(&conn)
                     || self.manual.contains(&conn);
+                if self.applying {
+                    // Replicated DDL must apply on every node regardless of local readers.
+                    self.pending.clear();
+                    if matches!(s, Stmt::AlterTable { .. }) {
+                        return self.alter_exec(s, conn, false);
+                    }
+                    let r = self.exec_stmt(s, conn)?;
+                    self.log_after(s)?;
+                    return Ok(r);
+                }
                 if let Some(j) = &self.alter {
                     let mut e = SqlError::internal(format!(
                         "Lock wait timeout exceeded; ALTER TABLE on `{}` is in progress (retry when it finishes)",
@@ -512,7 +532,8 @@ impl Engine {
                     Ok(r)
                 } else if matches!(s, Stmt::AlterTable { .. }) {
                     self.commit_txn(conn)?;
-                    self.alter_exec(s, conn, true)
+                    let online = !self.capturing;
+                    self.alter_exec(s, conn, online)
                 } else {
                     // Old versions in dropped trees are gone; forget them.
                     self.pending.clear();
@@ -3099,7 +3120,7 @@ impl Engine {
 
     /// Binlog or change hook wants logical records.
     fn logging(&self) -> bool {
-        self.binlog.is_some() || self.hook.is_some()
+        self.binlog.is_some() || self.hook.is_some() || self.capturing
     }
 
     fn emit(&self, ops: &[LogOp]) {

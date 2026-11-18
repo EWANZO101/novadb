@@ -147,6 +147,16 @@ fn encode(r: &Record) -> Result<Vec<u8>> {
     Ok(w.0)
 }
 
+/// Binary form of a record (cluster replication).
+pub fn encode_record(r: &Record) -> Result<Vec<u8>> {
+    encode(r)
+}
+
+/// Inverse of [`encode_record`] (bounds-checked).
+pub fn decode_record(b: &[u8]) -> Result<Record> {
+    decode(b)
+}
+
 fn decode(b: &[u8]) -> Result<Record> {
     let mut r = R::new(b);
     let ts = r.u64()?;

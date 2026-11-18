@@ -16,6 +16,8 @@
 //! log compaction with InstallSnapshot, and single-server membership changes.
 #![forbid(unsafe_code)]
 
+pub mod codec;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

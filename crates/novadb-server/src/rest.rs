@@ -589,6 +589,56 @@ async fn sql(
     )))
 }
 
+// ----- cluster -------------------------------------------------------------------------------
+
+async fn cluster_status(
+    State(a): St,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    h: HeaderMap,
+) -> Result<Json<J>, ApiErr> {
+    a.auth(&h, &client_ip(peer, &h))?;
+    match &a.server.cluster {
+        Some(c) => Ok(Json(c.status_json())),
+        None => Err(ApiErr(
+            StatusCode::NOT_FOUND,
+            0,
+            "not running in cluster mode".into(),
+        )),
+    }
+}
+
+async fn cluster_remove(
+    State(a): St,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    h: HeaderMap,
+    Path(id): Path<u64>,
+) -> Result<Json<J>, ApiErr> {
+    let tok = a.auth(&h, &client_ip(peer, &h))?;
+    if !tok.user.eq_ignore_ascii_case("root") {
+        return Err(ApiErr(
+            StatusCode::FORBIDDEN,
+            1227,
+            "removing cluster nodes needs a token for the root user".into(),
+        ));
+    }
+    let c = a.server.cluster.clone().ok_or_else(|| {
+        ApiErr(
+            StatusCode::NOT_FOUND,
+            0,
+            "not running in cluster mode".into(),
+        )
+    })?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    c.events
+        .send(crate::cluster::Event::RemoveNode(id, tx))
+        .map_err(|_| bad("cluster driver stopped"))?;
+    match tokio::time::timeout(Duration::from_secs(15), rx).await {
+        Ok(Ok(Ok(()))) => Ok(Json(json!({"removed": id}))),
+        Ok(Ok(Err(e))) => Err(ApiErr(StatusCode::CONFLICT, 0, e)),
+        _ => Err(ApiErr(StatusCode::SERVICE_UNAVAILABLE, 0, "timeout".into())),
+    }
+}
+
 // ----- WebSocket -----------------------------------------------------------------------------
 
 async fn ws(
@@ -861,6 +911,8 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/v1/query/{name}", post(query))
         .route("/v1/sql", post(sql))
         .route("/v1/ws", get(ws))
+        .route("/v1/cluster", get(cluster_status))
+        .route("/v1/cluster/nodes/{id}/remove", post(cluster_remove))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(api)
 }

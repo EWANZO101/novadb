@@ -208,6 +208,14 @@ async fn handshake(
         return Ok(None);
     }
     let ok = server.verify(&user, password).await;
+    if ok {
+        // Only failures accumulate: apps that reconnect often are not locked out. Hashing
+        // CPU stays bounded by the 2-at-a-time semaphore.
+        server.limiter.forgive(&format!("ip:{ip}"));
+        server
+            .limiter
+            .forgive(&format!("user:{}", user.to_lowercase()));
+    }
     if !ok {
         eprintln!("[novadb] auth failed for '{user}' from {ip}");
         crate::ops::Metrics::inc(&server.metrics.auth_failures);

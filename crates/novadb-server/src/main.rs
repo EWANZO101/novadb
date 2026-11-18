@@ -12,6 +12,8 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+mod cluster;
+mod cluster_net;
 mod conn;
 mod ops;
 mod rest;
@@ -62,12 +64,22 @@ pub struct Server {
     max_packet: usize,
     started: Instant,
     active: AtomicUsize,
+    /// Cluster mode (Raft); None = single node.
+    cluster: Option<Arc<cluster::Handle>>,
 }
 
 impl Server {
     /// Execute one statement on the blocking pool (single writer engine). Returns the result
     /// and the connection's server status bits (IN_TRANS / AUTOCOMMIT).
     async fn run(&self, st: Stmt, sess: &mut Session) -> (Result<QueryResult, SqlError>, u16) {
+        if let Some(c) = self.cluster.clone() {
+            ops::Metrics::inc(&self.metrics.queries);
+            let r = self.run_cluster(c, st, sess).await;
+            if r.0.is_err() {
+                ops::Metrics::inc(&self.metrics.query_errors);
+            }
+            return r;
+        }
         let eng = self.engine.clone();
         let mut s = sess.clone();
         let cancel = self.conn(sess.conn_id).map(|c| {
@@ -131,6 +143,89 @@ impl Server {
                 (r, status)
             }
             Err(e) => (Err(SqlError::internal(format!("task: {e}"))), 2),
+        }
+    }
+
+    /// Cluster mode: capture on this node, replicate through Raft, answer after it is applied.
+    async fn run_cluster(
+        &self,
+        c: Arc<cluster::Handle>,
+        st: Stmt,
+        sess: &mut Session,
+    ) -> (Result<QueryResult, SqlError>, u16) {
+        let read = matches!(st, Stmt::Select(_));
+        if read && c.linearizable_reads {
+            if !c.is_leader.load(Ordering::Relaxed) {
+                return (Err(c.not_leader()), 2);
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if c.events.send(cluster::Event::Read(tx)).is_err() {
+                return (Err(SqlError::internal("cluster driver stopped")), 2);
+            }
+            match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => return (Err(e), 2),
+                _ => return (Err(c.not_leader()), 2),
+            }
+        }
+        // Writes are serialised on the leader: capture → replicate → apply, one at a time, so
+        // each capture sees every earlier commit (exact first-committer-wins checks).
+        let _guard = if read {
+            None
+        } else {
+            Some(c.write_lock.lock().await)
+        };
+        let eng = self.engine.clone();
+        let mut s = sess.clone();
+        let cancel = self.conn(sess.conn_id).map(|ci| {
+            ci.cancel.store(false, Ordering::Relaxed);
+            ci.cancel.clone()
+        });
+        let joined = tokio::task::spawn_blocking(move || {
+            novadb_sql::set_cancel_flag(cancel);
+            let r = match eng.lock() {
+                Ok(mut e) => {
+                    let r = e.capture(&st, &mut s);
+                    (r, e.status(s.conn_id))
+                }
+                Err(_) => (Err(SqlError::internal("engine lock poisoned")), 2),
+            };
+            novadb_sql::set_cancel_flag(None);
+            (r, s)
+        })
+        .await;
+        let ((cap, status), s) = match joined {
+            Ok(x) => x,
+            Err(e) => return (Err(SqlError::internal(format!("task: {e}"))), 2),
+        };
+        *sess = s;
+        let cap = match cap {
+            Ok(c) => c,
+            Err(e) => return (Err(e), status),
+        };
+        if cap.records.is_empty() {
+            return (Ok(cap.result), status);
+        }
+        // a change: only the leader may replicate it
+        let t0 = Instant::now();
+        while !c.ready.load(Ordering::Relaxed) {
+            if !c.is_leader.load(Ordering::Relaxed) || t0.elapsed() > Duration::from_secs(3) {
+                return (Err(c.not_leader()), status);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let data = match cluster::encode_sql(&cap.records) {
+            Ok(d) => d,
+            Err(e) => return (Err(e), status),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if c.events.send(cluster::Event::Propose(data, tx)).is_err() {
+            return (Err(SqlError::internal("cluster driver stopped")), status);
+        }
+        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+            Ok(Ok(Ok(()))) => (Ok(cap.result), status),
+            Ok(Ok(Err(e))) => (Err(e), status),
+            _ => (Err(cluster::unknown_outcome()), status),
         }
     }
 
@@ -265,6 +360,7 @@ struct Config {
     metrics_token: Option<String>,
     no_binlog: bool,
     rest: Option<SocketAddr>,
+    linearizable: bool,
 }
 
 /// Lower-case hex.
@@ -275,7 +371,8 @@ pub(crate) fn hex(b: &[u8]) -> String {
 const USAGE: &str = "usage:
   novadb-server --data-dir DIR [--listen 127.0.0.1:3307] [--tls-cert FILE --tls-key FILE]
                 [--backup-key FILE] [--metrics 127.0.0.1:9104] [--metrics-token-file FILE] [--no-binlog]
-                [--rest 127.0.0.1:3380]
+                [--rest 127.0.0.1:3380] [--linearizable-reads]
+  novadb-server cluster init|token|join|status …  (Raft cluster; `cluster` alone for help)
   novadb-server token create|list|revoke …   (REST/WebSocket API tokens; `token` alone for help)
   novadb-server query add|list|remove …      (saved queries for the REST `query` scope)
   novadb-server --restore BACKUP.nbk --data-dir NEW_DIR --backup-key FILE [--binlog-dir DIR] [--until 'YYYY-MM-DD HH:MM:SS']
@@ -288,7 +385,12 @@ fn parse_args() -> Result<Option<Config>, String> {
         println!("{}", tokens::cli(kind, &all[1..])?);
         return Ok(None);
     }
+    if all.first().is_some_and(|k| k == "cluster") {
+        println!("{}", cluster::cli(&all[1..])?);
+        return Ok(None);
+    }
     let mut rest: Option<String> = None;
+    let mut linearizable = false;
     let mut args = std::env::args().skip(1);
     let (mut dir, mut listen, mut cert, mut key) = (None, None, None, None);
     let (mut bkey, mut metrics, mut mtoken, mut no_binlog) = (None, None, None, false);
@@ -314,6 +416,7 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--metrics-token-file" => mtoken = args.next(),
             "--no-binlog" => no_binlog = true,
             "--rest" => rest = args.next(),
+            "--linearizable-reads" => linearizable = true,
             "--restore" => restore = args.next(),
             "--binlog-dir" => binlog_dir = args.next(),
             "--until" => until = args.next(),
@@ -369,6 +472,7 @@ fn parse_args() -> Result<Option<Config>, String> {
         None => None,
     };
     Ok(Some(Config {
+        linearizable,
         rest,
         data_dir,
         listen,
@@ -541,35 +645,141 @@ async fn serve(server: Arc<Server>, listen: SocketAddr) -> Result<(), String> {
     Ok(())
 }
 
+/// Cluster: the founding node creates `root` through the Raft log, so every node has it.
+async fn cluster_bootstrap_root(srv: &Arc<Server>, dir: &Path) -> Result<(), String> {
+    let pw = auth::random_password(24)?;
+    let path = dir.join(INITIAL_PW_FILE);
+    let st = novadb_sql::parse(&format!("CREATE USER root IDENTIFIED BY '{pw}'"))
+        .map_err(|e| e.to_string())?
+        .remove(0);
+    let mut sess = Session {
+        user: "root".into(),
+        conn_id: u32::MAX - 3,
+        ..Default::default()
+    };
+    let (r, _) = srv.run(st, &mut sess).await;
+    srv.end_session(sess.conn_id).await;
+    r.map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&path);
+    write_private(
+        &path,
+        format!("user: root\npassword: {pw}\n\nChange it: ALTER USER root IDENTIFIED BY '...';\nThen delete this file.\n").as_bytes(),
+    )?;
+    println!(
+        "[novadb] cluster: created user 'root' on all nodes; one-time password is in {} (0600)",
+        path.display()
+    );
+    Ok(())
+}
+
 fn run(cfg: Config) -> Result<(), String> {
     std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data dir: {e}"))?;
     std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| e.to_string())?;
     let backup_key = ops::load_or_create_key(&cfg.data_dir, cfg.backup_key.as_deref())?;
-    let mut engine = Engine::open(cfg.data_dir.join("db"))
-        .map_err(|e| e.to_string())?
-        .with_password_hasher(auth::hash_password)
-        .with_privileges();
-    if !cfg.no_binlog {
+    let cf = cluster::load(&cfg.data_dir)?;
+    // Change feed for WebSocket subscribers (only cloned while someone listens).
+    let (feed, _) = tokio::sync::broadcast::channel::<rest::Changes>(1024);
+    let open_engine = {
+        let feed = feed.clone();
+        move |p: &Path| -> Result<Engine, String> {
+            let mut e = Engine::open(p)
+                .map_err(|e| e.to_string())?
+                .with_password_hasher(auth::hash_password)
+                .with_privileges();
+            let f = feed.clone();
+            e.set_change_hook(Box::new(move |ops| {
+                if f.receiver_count() > 0 {
+                    let _ = f.send(Arc::new(ops.to_vec()));
+                }
+            }));
+            Ok(e)
+        }
+    };
+    let mut engine = open_engine(&cfg.data_dir.join("db"))?;
+    if cf.is_some() {
+        println!(
+            "[novadb] cluster mode: changes are replicated through the Raft log (local binlog off)"
+        );
+    } else if !cfg.no_binlog {
         // Encrypted binary log for point-in-time recovery.
         engine = engine
             .with_binlog(&cfg.data_dir.join("binlog"), Some(backup_key))
             .map_err(|e| e.to_string())?;
     }
-    bootstrap(&mut engine, &cfg.data_dir)?;
-    // Change feed for WebSocket subscribers (only cloned while someone listens).
-    let (feed, _) = tokio::sync::broadcast::channel::<rest::Changes>(1024);
-    {
-        let feed = feed.clone();
-        engine.set_change_hook(Box::new(move |ops| {
-            if feed.receiver_count() > 0 {
-                let _ = feed.send(Arc::new(ops.to_vec()));
-            }
-        }));
-    }
+    // Single node: create root directly. Cluster: the founding node replicates it (below).
+    let cluster_bootstrap = match &cf {
+        None => {
+            bootstrap(&mut engine, &cfg.data_dir)?;
+            false
+        }
+        Some(c) => {
+            c.member
+                && engine.users().map_err(|e| e.to_string())?.is_empty()
+                && engine.cluster_applied().map_err(|e| e.to_string())? == 0
+        }
+    };
     let tls = tls_config(&cfg)?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(16)
+        .enable_all()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))?;
+    let engine = Arc::new(Mutex::new(engine));
+    let handle = match &cf {
+        None => None,
+        Some(c) => {
+            let (etx, erx) = std::sync::mpsc::channel();
+            let h = Arc::new(cluster::Handle {
+                node_id: c.node_id,
+                events: etx.clone(),
+                is_leader: std::sync::atomic::AtomicBool::new(false),
+                ready: std::sync::atomic::AtomicBool::new(false),
+                leader: std::sync::atomic::AtomicU64::new(0),
+                term: std::sync::atomic::AtomicU64::new(0),
+                commit: std::sync::atomic::AtomicU64::new(0),
+                applied: std::sync::atomic::AtomicU64::new(0),
+                peers: std::sync::RwLock::new(c.peers.clone()),
+                voters: std::sync::RwLock::new(Vec::new()),
+                write_lock: tokio::sync::Mutex::new(()),
+                linearizable_reads: cfg.linearizable,
+            });
+            let id = cluster_net::load_identity(&cfg.data_dir)?;
+            let outbox = cluster_net::Outbox::new(rt.handle().clone(), &id, &c.peers)?;
+            let slot = cluster::EngineSlot {
+                engine: engine.clone(),
+                data_dir: cfg.data_dir.clone(),
+                open: Box::new(open_engine.clone()),
+            };
+            let driver = cluster::Driver::new(&cfg.data_dir, c, slot, h.clone(), outbox)?;
+            std::thread::Builder::new()
+                .name("novadb-raft".into())
+                .spawn(move || driver.run(erx))
+                .map_err(|e| e.to_string())?;
+            let acceptor = TlsAcceptor::from(Arc::new(cluster_net::server_config(&id)?));
+            rt.spawn(cluster_net::listen(
+                c.raft_listen.clone(),
+                acceptor,
+                etx,
+                cfg.data_dir.clone(),
+                h.clone(),
+            ));
+            if !c.member {
+                let me = c.peers.get(&c.node_id).cloned().unwrap_or_default();
+                rt.spawn(cluster_net::ask_to_join_owned(
+                    id,
+                    c.node_id,
+                    me,
+                    h.clone(),
+                    cfg.data_dir.clone(),
+                ));
+            }
+            Some(h)
+        }
+    };
     let server = Arc::new(Server {
-        engine: Arc::new(Mutex::new(engine)),
+        engine,
         data_dir: cfg.data_dir.clone(),
         backup_key,
         metrics: ops::Metrics::default(),
@@ -582,13 +792,20 @@ fn run(cfg: Config) -> Result<(), String> {
         max_packet: novadb_protocol::DEFAULT_MAX_ALLOWED_PACKET,
         started: Instant::now(),
         active: AtomicUsize::new(0),
+        cluster: handle.clone(),
     });
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .max_blocking_threads(16)
-        .enable_all()
-        .build()
-        .map_err(|e| format!("runtime: {e}"))?;
+    if cluster_bootstrap && let Some(h) = handle {
+        let srv = server.clone();
+        let dir = cfg.data_dir.clone();
+        rt.spawn(async move {
+            while !h.ready.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if let Err(e) = cluster_bootstrap_root(&srv, &dir).await {
+                eprintln!("[novadb] cluster: creating root failed: {e}");
+            }
+        });
+    }
     if let Some(addr) = cfg.metrics {
         if !addr.ip().is_loopback() && cfg.metrics_token.is_none() {
             return Err("--metrics on a non-loopback address needs --metrics-token-file".into());
