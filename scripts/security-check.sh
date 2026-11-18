@@ -17,11 +17,23 @@ if grep -rnE '\bunsafe\s*(\{|fn|impl|trait)' crates fuzz/fuzz_targets --include=
 if grep -rnE '(:|= *)3306\b' crates --include=*.rs | grep -v 'ends_with(":3306")'; then bad "port 3306 referenced"; else ok "no 3306 defaults"; fi
 if grep -rn '0\.0\.0\.0' crates --include=*.rs; then bad "0.0.0.0 bind found"; else ok "no wildcard binds"; fi
 
-# no default credentials (PLAN §4.1)
-if grep -rniE '"admin"|admin/admin|password *= *"' crates --include=*.rs; then bad "default credentials"; else ok "no default credentials"; fi
+# no default credentials (PLAN §4.1). In the dashboard "admin" is also a role name, so it is
+# checked structurally instead: the bootstrap account must get a random one-time password
+# written to a new 0600 file, and no password literal may be hashed (except the timing dummy).
+if grep -rniE 'admin/admin|password *= *"' crates --include=*.rs; then bad "default credentials"; else ok "no default credential literals"; fi
+if grep -rnE '"admin"' crates --include=*.rs | grep -v '^crates/novadb-dashboard/'; then bad "\"admin\" literal outside dashboard"; else ok "no admin literal outside dashboard"; fi
+D=crates/novadb-dashboard/src
+if [ -d "$D" ]; then
+  boot=$(sed -n '/^fn bootstrap/,/^}/p' $D/main.rs)
+  echo "$boot" | grep -q 'auth::random_password(24)' && echo "$boot" | grep -q 'create_new(true)' && echo "$boot" | grep -q 'mode(0o600)' && echo "$boot" | grep -q 'must_change: true' \
+    && ok "dashboard bootstrap: random one-time password, 0600 create_new, forced change" || bad "dashboard bootstrap hardening missing"
+  if grep -rnE 'hash_password\("' $D | grep -v 'dummy password for timing equalisation' | grep -v '#\[cfg(test)\]' | sed '/mod tests/,$d' | grep -v '/auth.rs:.*correct horse'; then bad "hard-coded password hashed"; else ok "no hard-coded passwords hashed"; fi
+fi
 
-# no mysql_native_password / SHA1 auth (PLAN §4.4)
-if grep -rni 'mysql_native_password\|sha1' crates --include=*.rs; then bad "SHA1/native auth referenced"; else ok "no SHA1 auth"; fi
+# no mysql_native_password / SHA1 auth (PLAN §4.4). Exception: RFC 6238 TOTP is defined as
+# HMAC-SHA1 (dashboard 2FA codes, not password storage); it may live only in totp.rs.
+if grep -rni 'mysql_native_password' crates --include=*.rs; then bad "mysql_native_password referenced"; else ok "no mysql_native_password"; fi
+if grep -rni 'sha1' crates --include=*.rs | grep -v '^crates/novadb-dashboard/src/totp.rs:'; then bad "SHA1 used outside TOTP"; else ok "SHA1 only in TOTP (RFC 6238)"; fi
 
 # no secrets committed
 FILES=$(git ls-files) || { bad "git ls-files failed"; FILES=""; }
