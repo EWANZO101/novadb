@@ -25,6 +25,7 @@ use crate::oauth::{self, Flows, Kind, Mode, Provider};
 use crate::store::{Link, Role, Session, Shared, Stage, User, clip};
 use crate::{auth, totp};
 
+mod bk;
 mod dbs;
 mod more;
 
@@ -59,6 +60,13 @@ pub struct App {
     pub started: u64,
     /// Embedded SQL workspace behind the Databases screen (None if it failed to open).
     pub sql: Option<crate::sqlws::SqlShared>,
+    /// Backup files of the SQL workspace (None if the folder could not be prepared).
+    pub backups: Option<Arc<crate::backup::Backups>>,
+}
+
+/// Scheduler hook: take the daily automatic backup when it is due.
+pub async fn auto_backup(app: &App) {
+    bk::auto_tick(app).await;
 }
 
 type S = Arc<App>;
@@ -102,6 +110,13 @@ pub fn router(app: S) -> Router {
             post(more::account_revoke_all),
         )
         .route("/login/recovery", post(more::login_recovery))
+        .route("/backups", get(bk::backups_page))
+        .route("/backups/create", post(bk::backups_create))
+        .route("/backups/verify", post(bk::backups_verify))
+        .route("/backups/delete", post(bk::backups_delete))
+        .route("/backups/restore", post(bk::backups_restore))
+        .route("/backups/restore/{name}", get(bk::backups_restore_page))
+        .route("/backups/download/{name}", get(bk::backups_download))
         .route("/databases", get(dbs::databases_page))
         .route("/databases/query", post(dbs::databases_query))
         .route("/databases/demo", post(dbs::databases_demo))

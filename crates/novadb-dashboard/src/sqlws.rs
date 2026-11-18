@@ -247,6 +247,132 @@ CREATE TABLE IF NOT EXISTS orders (id INT PRIMARY KEY AUTO_INCREMENT, customer_i
 INSERT INTO customers (name, email, city) VALUES ('Thandi Mokoena', 'thandi@example.com', 'Johannesburg'), ('Pieter van Wyk', 'pieter@example.com', 'Cape Town'), ('Aisha Patel', 'aisha@example.com', 'Durban'), ('Sipho Dlamini', 'sipho@example.com', 'Pretoria');
 INSERT INTO orders (customer_id, total, status) VALUES (1, 499.99, 'paid'), (1, 120.00, 'pending'), (2, 2450.50, 'paid'), (3, 89.95, 'refunded'), (4, 1310.00, 'paid')";
 
+// ----- logical dump / restore ---------------------------------------------------------------
+
+/// What a dump contains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DumpInfo {
+    pub tables: usize,
+    pub rows: usize,
+}
+
+/// Rows per INSERT statement in a dump.
+const DUMP_BATCH: usize = 100;
+
+fn quote_ident(n: &str) -> String {
+    format!("`{}`", n.replace('`', "``"))
+}
+
+/// SQL literal that the NovaDB lexer reads back to the same value.
+pub fn sql_literal(v: &novadb_sql::Value) -> String {
+    use novadb_sql::Value;
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Int(_) | Value::Dec { .. } => v.text().unwrap_or_default(),
+        Value::Bytes(b) => {
+            if b.is_empty() {
+                "''".into()
+            } else {
+                format!(
+                    "X'{}'",
+                    b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                )
+            }
+        }
+        other => format!(
+            "'{}'",
+            other
+                .text()
+                .unwrap_or_default()
+                .replace('\\', "\\\\")
+                .replace('\'', "''")
+        ),
+    }
+}
+
+fn run1(e: &mut Engine, s: &mut Session, q: &str) -> Result<QueryResult, String> {
+    let st = novadb_sql::parse(q).map_err(|x| x.to_string())?;
+    let first = st.first().ok_or("empty statement")?;
+    e.run_in(first, s).map_err(|x| x.to_string())
+}
+
+fn table_names(e: &mut Engine, s: &mut Session) -> Result<Vec<String>, String> {
+    let r = run1(e, s, "SHOW TABLES")?;
+    Ok((0..r.rows.len()).filter_map(|i| r.text(i, 0)).collect())
+}
+
+/// Consistent logical dump (one snapshot) of every table: CREATE TABLE + batched INSERTs.
+/// Returns the statements only; the caller adds the header and checksum.
+pub fn dump(e: &mut Engine, s: &mut Session) -> Result<(String, DumpInfo), String> {
+    let saved = s.max_execution_ms;
+    s.max_execution_ms = 0; // internal job: no per-SELECT limit
+    let r = (|| {
+        run1(e, s, "BEGIN")?;
+        let mut out = String::new();
+        let mut info = DumpInfo::default();
+        for t in table_names(e, s)? {
+            let q = quote_ident(&t);
+            let create = run1(e, s, &format!("SHOW CREATE TABLE {q}"))?
+                .text(0, 1)
+                .ok_or_else(|| format!("no CREATE statement for {t}"))?;
+            out.push_str(&format!(
+                "\n-- table {t}\nDROP TABLE IF EXISTS {q};\n{create};\n"
+            ));
+            let rows = run1(e, s, &format!("SELECT * FROM {q}"))?;
+            let cols = rows
+                .columns
+                .iter()
+                .map(|c| quote_ident(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for chunk in rows.rows.chunks(DUMP_BATCH) {
+                let vals: Vec<String> = chunk
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "({})",
+                            r.iter().map(sql_literal).collect::<Vec<_>>().join(", ")
+                        )
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "INSERT INTO {q} ({cols}) VALUES\n  {};\n",
+                    vals.join(",\n  ")
+                ));
+            }
+            info.tables += 1;
+            info.rows += rows.rows.len();
+        }
+        run1(e, s, "COMMIT")?;
+        Ok((out, info))
+    })();
+    s.max_execution_ms = saved;
+    r
+}
+
+/// Drop every table in the workspace. Returns how many were dropped.
+pub fn drop_all(e: &mut Engine, s: &mut Session) -> Result<usize, String> {
+    let names = table_names(e, s)?;
+    for t in &names {
+        run1(e, s, &format!("DROP TABLE IF EXISTS {}", quote_ident(t)))?;
+    }
+    Ok(names.len())
+}
+
+/// Replace the workspace with a dump. Stops at the first failing statement.
+pub fn load(e: &mut Engine, s: &mut Session, script: &str) -> Result<usize, String> {
+    let stmts = novadb_sql::parse(script).map_err(|x| x.to_string())?;
+    if stmts.iter().any(|st| classify(st) == Kind::Forbidden) {
+        return Err("dump contains SQL account statements".into());
+    }
+    drop_all(e, s)?;
+    for (i, st) in stmts.iter().enumerate() {
+        e.run_in(st, s)
+            .map_err(|x| format!("statement {}: {x}", i + 1))?;
+    }
+    Ok(stmts.len())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -300,6 +426,54 @@ mod tests {
         e.end_session(7);
         let r = e.query("SELECT * FROM orders").unwrap();
         assert_eq!(r.rows.len(), 5, "uncommitted delete must roll back");
+        e.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dump_round_trip() {
+        let d = std::env::temp_dir().join(format!("novadb-sqlws-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let mut e = Engine::open(&d).unwrap();
+        let mut s = Session {
+            conn_id: 9,
+            ..Session::default()
+        };
+        run_all(&mut e, &mut s, &parse_script(DEMO_SQL).unwrap());
+        run_all(
+            &mut e,
+            &mut s,
+            &parse_script("CREATE TABLE odd (k INT PRIMARY KEY, t TEXT, b BLOB, d DATETIME(3)); INSERT INTO odd VALUES (1, 'it''s a \\\\ back; slash -- not comment', X'00FF', '2026-01-02 03:04:05.678'), (2, NULL, NULL, NULL)").unwrap(),
+        );
+        let before: Vec<String> = ["customers", "orders", "odd"]
+            .iter()
+            .map(|t| format!("{:?}", e.query(&format!("SELECT * FROM {t}")).unwrap().rows))
+            .collect();
+        let (sql, info) = dump(&mut e, &mut s).unwrap();
+        assert_eq!(
+            info,
+            DumpInfo {
+                tables: 3,
+                rows: 11
+            }
+        );
+        run1(&mut e, &mut s, "DELETE FROM orders").unwrap();
+        run1(&mut e, &mut s, "CREATE TABLE extra (a INT)").unwrap();
+        load(&mut e, &mut s, &sql).unwrap();
+        let after: Vec<String> = ["customers", "orders", "odd"]
+            .iter()
+            .map(|t| format!("{:?}", e.query(&format!("SELECT * FROM {t}")).unwrap().rows))
+            .collect();
+        assert_eq!(before, after);
+        assert!(
+            e.query("SELECT * FROM extra").is_err(),
+            "tables not in the dump are dropped"
+        );
+        // AUTO_INCREMENT continues after the restored ids.
+        let r = e
+            .execute("INSERT INTO orders (customer_id, total) VALUES (1, 1.00)")
+            .unwrap();
+        assert_eq!(r[0].last_insert_id, 6);
         e.close().unwrap();
         let _ = std::fs::remove_dir_all(&d);
     }

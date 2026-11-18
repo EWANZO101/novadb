@@ -334,6 +334,18 @@ pre.ddl code{background:none;border:0;padding:0}
 .crumbs{margin:0 0 8px;font-size:13px}
 .crumbs a{color:var(--mut)}
 
+/* ---------- backups ---------- */
+.row.end{justify-content:flex-end;flex-wrap:nowrap}
+.row.end .btn.sm{width:32px;padding:0}
+.danger-zone{border-color:color-mix(in srgb,var(--bad) 40%,transparent)}
+.danger-zone .card-h{background:var(--bad-soft)}
+.danger-zone .card-h svg.i{color:var(--bad)}
+.formgrid.narrow{max-width:420px}
+.formgrid .row{margin-top:20px}
+.formgrid .row button,.formgrid .row .btn{margin:0}
+button.danger-solid{background:var(--bad);color:#fff}
+button.danger-solid:hover{background:color-mix(in srgb,var(--bad) 85%,#000)}
+
 /* ---------- responsive ---------- */
 @media (max-width:1000px){
   .cols,.cols-32,.cols-13{grid-template-columns:minmax(0,1fr)}

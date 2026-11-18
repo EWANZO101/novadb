@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+mod backup;
 mod html;
 mod oauth;
 mod sqlws;
@@ -132,6 +133,13 @@ fn run() -> Result<(), String> {
         }
     };
     let sql_close = sql.clone();
+    let backups = match backup::Backups::new(data_dir.join("backups")) {
+        Ok(b) => Some(Arc::new(b)),
+        Err(e) => {
+            eprintln!("[dashboard] backups unavailable: {e}");
+            None
+        }
+    };
 
     let cfg = web::Config {
         public_url,
@@ -157,6 +165,7 @@ fn run() -> Result<(), String> {
         http,
         started: web::now(),
         sql,
+        backups,
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -166,7 +175,18 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
     let pruner = store.clone();
+    let bk_app = app.clone();
     rt.block_on(async move {
+        tokio::spawn(async move {
+            // First check shortly after start, then hourly; a backup is taken when the last
+            // automatic one is older than a day.
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            let mut iv = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                iv.tick().await;
+                web::auto_backup(&bk_app).await;
+            }
+        });
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_secs(300));
             loop {

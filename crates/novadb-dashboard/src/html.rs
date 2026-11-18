@@ -251,12 +251,13 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
                 "/sessions" => "Sessions",
                 "/system" => "System",
                 "/databases" => "Databases",
+                "/backups" => "Backups",
                 _ => "Overview",
             };
             format!(
                 r#"<div class="shell"><aside class="side">{brand}
 <nav class="nav" aria-label="Main"><div class="nav-label">Control</div>{items}
-<div class="nav-label">Engine</div>{dbl}<span class="dis">{ibk}Backups<span class="soon">Stage 7</span></span><span class="dis">{icl}Cluster<span class="soon">Stage 8</span></span>
+<div class="nav-label">Engine</div>{dbl}{bkl}<span class="dis">{icl}Cluster<span class="soon">Stage 8</span></span>
 <div class="nav-label">You</div><a href="/account"{acc_cls}>{iac}Account</a></nav>
 <div class="side-foot"><div class="me">{av}<span class="me-t"><b>{user}</b><small>{role}</small></span>
 <form method="post" action="/logout">{csrf}<button class="iconbtn" title="Sign out" aria-label="Sign out">{ilo}</button></form></div>
@@ -282,7 +283,22 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
                         icon("database")
                     )
                 },
-                ibk = icon("archive"),
+                bkl = if n.role >= Role::Admin {
+                    format!(
+                        r#"<a href="/backups"{}>{}Backups</a>"#,
+                        if n.active == "/backups" {
+                            r#" class="on" aria-current="page""#
+                        } else {
+                            ""
+                        },
+                        icon("archive")
+                    )
+                } else {
+                    format!(
+                        r#"<span class="dis">{}Backups<span class="soon">Admin</span></span>"#,
+                        icon("archive")
+                    )
+                },
                 icl = icon("network"),
                 iac = icon("user"),
                 ilo = icon("logout"),
@@ -365,6 +381,27 @@ pub fn ts(secs: u64) -> String {
     )
 }
 
+/// Inverse of [`ts`]: `YYYY-MM-DD HH:MM:SS` (UTC) to unix seconds.
+pub fn parse_ts(s: &str) -> Option<u64> {
+    let (d, t) = s.split_once(' ')?;
+    let mut dp = d.split('-').map(|x| x.parse::<i64>().ok());
+    let (y, m, dd) = (dp.next()??, dp.next()??, dp.next()??);
+    let mut tp = t.split(':').map(|x| x.parse::<i64>().ok());
+    let (hh, mi, ss) = (tp.next()??, tp.next()??, tp.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&dd) || hh > 23 || mi > 59 || ss > 60 {
+        return None;
+    }
+    // Days-from-civil (Howard Hinnant).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + dd - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mi * 60 + ss).ok()
+}
+
 /// "3m ago" style.
 pub fn ago(now: u64, then: u64) -> String {
     if then == 0 {
@@ -397,6 +434,12 @@ mod tests {
         assert_eq!(ts(1_700_000_000), "2023-11-14 22:13:20");
         assert_eq!(ts(951_782_400), "2000-02-29 00:00:00");
         assert_eq!(ago(100, 40), "1m ago");
+        for t in [0u64, 951_782_400, 1_700_000_000, 1_800_000_123] {
+            if t > 0 {
+                assert_eq!(parse_ts(&ts(t)), Some(t));
+            }
+        }
+        assert_eq!(parse_ts("2026-13-01 00:00:00"), None);
         assert_eq!(bytes(1536), "1.5 KiB");
         assert_eq!(initials("jack.silver"), "JS");
         assert_eq!(initials("admin"), "AD");
