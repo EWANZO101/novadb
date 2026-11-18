@@ -48,7 +48,7 @@ OAuth redirect URIs to register: `<public url>/oauth/discord/callback`, `<public
     cp target/release/novadb-dashboard docker/
     docker build -f docker/dashboard.Dockerfile -t novadb-dashboard docker/ && rm docker/novadb-dashboard
     docker run -d --name novadb-dashboard --restart unless-stopped --network host --read-only \
-      --tmpfs /tmp:size=16m --cap-drop ALL --security-opt no-new-privileges --memory 256m --cpus 0.5 \
+      --tmpfs /tmp:size=16m --cap-drop ALL --security-opt no-new-privileges --memory 384m --cpus 0.5 \
       --pids-limit 128 -v novadb-dash-data:/data \
       -e NOVADB_DASH_PUBLIC_URL=https://novadb.example.com novadb-dashboard
     docker exec novadb-dashboard cat /data/initial-admin-password.txt   # once

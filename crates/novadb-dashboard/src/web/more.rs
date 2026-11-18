@@ -10,7 +10,7 @@ const PAGE: usize = 50;
 // ----- small helpers -----------------------------------------------------------------------
 
 /// Percent-encode a query-string value.
-fn qenc(s: &str) -> String {
+pub(super) fn qenc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -245,7 +245,7 @@ pub(super) async fn audit_page(
 }
 
 /// One CSV cell: quoted, quotes doubled, and spreadsheet formula triggers neutralised.
-fn csv_cell(s: &str) -> String {
+pub(super) fn csv_cell(s: &str) -> String {
     let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
         format!("'{s}")
     } else {

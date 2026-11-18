@@ -16,6 +16,7 @@
 mod auth;
 mod html;
 mod oauth;
+mod sqlws;
 mod store;
 mod totp;
 mod web;
@@ -122,6 +123,15 @@ fn run() -> Result<(), String> {
         );
     }
     let store = Shared::new(st);
+    // The SQL workspace is optional: if it cannot open, the rest of the dashboard still works.
+    let sql = match sqlws::SqlShared::open(&data_dir.join("sql")) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[dashboard] SQL workspace unavailable: {e}");
+            None
+        }
+    };
+    let sql_close = sql.clone();
 
     let cfg = web::Config {
         public_url,
@@ -146,6 +156,7 @@ fn run() -> Result<(), String> {
         flows: oauth::Flows::new(),
         http,
         started: web::now(),
+        sql,
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -200,6 +211,9 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("serve: {e}"))
     })?;
     drop(rt);
+    if let Some(Err(e)) = sql_close.map(|s| s.close()) {
+        eprintln!("[dashboard] SQL workspace close failed: {e}");
+    }
     // All handler clones are gone once the runtime is dropped.
     store.close()
 }

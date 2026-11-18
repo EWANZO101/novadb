@@ -130,6 +130,14 @@ pub fn icon(name: &str) -> String {
         "settings" => {
             r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>"#
         }
+        "table" => {
+            r#"<path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/>"#
+        }
+        "list" => {
+            r#"<path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M3 6h.01"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M8 6h13"/>"#
+        }
+        "code" => r#"<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>"#,
+        "play" => r#"<path d="M6 3l14 9-14 9V3z"/>"#,
         "zap" => {
             r#"<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>"#
         }
@@ -242,12 +250,13 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
                 "/account" => "Account",
                 "/sessions" => "Sessions",
                 "/system" => "System",
+                "/databases" => "Databases",
                 _ => "Overview",
             };
             format!(
                 r#"<div class="shell"><aside class="side">{brand}
 <nav class="nav" aria-label="Main"><div class="nav-label">Control</div>{items}
-<div class="nav-label">Engine</div><span class="dis">{idb}Databases<span class="soon">Soon</span></span><span class="dis">{ibk}Backups<span class="soon">Stage 7</span></span><span class="dis">{icl}Cluster<span class="soon">Stage 8</span></span>
+<div class="nav-label">Engine</div>{dbl}<span class="dis">{ibk}Backups<span class="soon">Stage 7</span></span><span class="dis">{icl}Cluster<span class="soon">Stage 8</span></span>
 <div class="nav-label">You</div><a href="/account"{acc_cls}>{iac}Account</a></nav>
 <div class="side-foot"><div class="me">{av}<span class="me-t"><b>{user}</b><small>{role}</small></span>
 <form method="post" action="/logout">{csrf}<button class="iconbtn" title="Sign out" aria-label="Sign out">{ilo}</button></form></div>
@@ -257,7 +266,22 @@ pub fn page(title: &str, nav: Option<&Nav<'_>>, flash: Flash<'_>, body: &str) ->
 <main>{flash_html}{body}</main>
 <footer class="foot"><span>NovaDB control dashboard v{ver}</span><span>Times shown in UTC</span></footer></div></div>"#,
                 brand = brand(),
-                idb = icon("database"),
+                dbl = if n.role >= Role::Operator {
+                    format!(
+                        r#"<a href="/databases"{}>{}Databases</a>"#,
+                        if n.active == "/databases" {
+                            r#" class="on" aria-current="page""#
+                        } else {
+                            ""
+                        },
+                        icon("database")
+                    )
+                } else {
+                    format!(
+                        r#"<span class="dis">{}Databases<span class="soon">Operator</span></span>"#,
+                        icon("database")
+                    )
+                },
                 ibk = icon("archive"),
                 icl = icon("network"),
                 iac = icon("user"),

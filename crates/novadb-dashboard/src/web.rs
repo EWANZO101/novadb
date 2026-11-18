@@ -25,6 +25,7 @@ use crate::oauth::{self, Flows, Kind, Mode, Provider};
 use crate::store::{Link, Role, Session, Shared, Stage, User, clip};
 use crate::{auth, totp};
 
+mod dbs;
 mod more;
 
 pub const SESSION_COOKIE: &str = "__Host-novadb_session";
@@ -56,6 +57,8 @@ pub struct App {
     /// Hash verified for unknown users so timing does not reveal which names exist.
     pub dummy_hash: String,
     pub started: u64,
+    /// Embedded SQL workspace behind the Databases screen (None if it failed to open).
+    pub sql: Option<crate::sqlws::SqlShared>,
 }
 
 type S = Arc<App>;
@@ -99,6 +102,10 @@ pub fn router(app: S) -> Router {
             post(more::account_revoke_all),
         )
         .route("/login/recovery", post(more::login_recovery))
+        .route("/databases", get(dbs::databases_page))
+        .route("/databases/query", post(dbs::databases_query))
+        .route("/databases/demo", post(dbs::databases_demo))
+        .route("/databases/t/{name}", get(dbs::table_page))
         .route("/oauth/{provider}/start", get(oauth_start_login))
         .route("/oauth/{provider}/link", post(oauth_start_link))
         .route("/oauth/{provider}/callback", get(oauth_callback))
