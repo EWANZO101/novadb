@@ -21,6 +21,7 @@ pub mod codec;
 pub mod error;
 pub mod exec;
 pub mod lexer;
+pub mod mvcc;
 pub mod parser;
 pub mod value;
 

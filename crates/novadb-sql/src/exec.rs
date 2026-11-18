@@ -2,7 +2,7 @@
 //! statement is atomic: on any error nothing it did is kept.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::path::Path;
 
@@ -14,6 +14,7 @@ use crate::catalog::{
 };
 use crate::codec::{key_encode, prefix_end, row_decode, row_encode};
 use crate::error::{Result, SqlError};
+use crate::mvcc::{self, Mv, TS_LEN, WriteSet};
 use crate::parser::parse;
 use crate::value::{ArithOp, ColType, Value, arith, coerce, compare, like, sort_cmp};
 
@@ -22,7 +23,8 @@ use crate::value::{ArithOp, ColType, Value, arith, coerce, compare, like, sort_c
 pub const MAX_ROWS_IN_MEMORY: usize = 1_000_000;
 /// Max encoded row size (rows above `INLINE_MAX` are chunked into the overflow tree).
 pub const MAX_ROW_BYTES: usize = 4 << 20;
-const INLINE_MAX: usize = MAX_VALUE_LEN - 1;
+/// Row payload that fits one storage value (minus the MVCC flag and the inline/overflow byte).
+const INLINE_MAX: usize = MAX_VALUE_LEN - 2;
 const CHUNK: usize = 4000;
 const SCAN_BATCH: usize = 256;
 
@@ -82,11 +84,26 @@ thread_local! {
     static CURRENT: std::cell::RefCell<Session> = std::cell::RefCell::new(Session::default());
 }
 
+/// An open multi-statement transaction.
+struct Txn {
+    snap: u64,
+    ws: WriteSet,
+}
+
+/// Max versioned keys re-checked for pruning per commit.
+const GC_BATCH: usize = 1000;
+
 pub struct Engine {
     db: Db,
     clock: Clock,
     hasher: Option<PasswordHasher>,
     default_session: Session,
+    /// Open transactions by connection id.
+    txns: HashMap<u32, Txn>,
+    /// Connections with autocommit = 0.
+    manual: HashSet<u32>,
+    /// Keys whose old versions were kept for a then-active snapshot.
+    pending: HashSet<(Tree, Vec<u8>)>,
 }
 
 fn system_now() -> i64 {
@@ -103,6 +120,9 @@ impl Engine {
             clock: Box::new(system_now),
             hasher: None,
             default_session: Session::default(),
+            txns: HashMap::new(),
+            manual: HashSet::new(),
+            pending: HashSet::new(),
         })
     }
     pub fn open_vfs(vfs: Box<dyn Vfs>, opts: Options) -> Result<Engine> {
@@ -111,6 +131,9 @@ impl Engine {
             clock: Box::new(system_now),
             hasher: None,
             default_session: Session::default(),
+            txns: HashMap::new(),
+            manual: HashSet::new(),
+            pending: HashSet::new(),
         })
     }
     /// Replace the clock used by NOW()/CURRENT_TIMESTAMP (tests).
@@ -261,18 +284,222 @@ impl Engine {
     /// Run one statement for a connection's session.
     pub fn run_in(&mut self, s: &Stmt, sess: &mut Session) -> Result<QueryResult> {
         CURRENT.with(|c| *c.borrow_mut() = sess.clone());
+        let conn = sess.conn_id;
         let r = match s {
+            Stmt::Txn(TxnKind::Begin) => {
+                self.commit_txn(conn)?;
+                self.begin_txn(conn).map(|_| QueryResult::ok(0))
+            }
+            Stmt::Txn(TxnKind::Commit) => self.commit_txn(conn).map(|_| QueryResult::ok(0)),
+            Stmt::Txn(TxnKind::Rollback) => {
+                self.txns.remove(&conn);
+                Ok(QueryResult::ok(0))
+            }
+            Stmt::Set(assignments) if assignments.iter().any(|(n, _)| n == "autocommit") => {
+                for (n, e) in assignments {
+                    if n == "autocommit" {
+                        let env = Env {
+                            t: None,
+                            row: &[],
+                            now: (self.clock)(),
+                        };
+                        match eval(e, &env)?.truth() {
+                            Some(true) => {
+                                self.commit_txn(conn)?;
+                                self.manual.remove(&conn);
+                            }
+                            Some(false) => {
+                                self.manual.insert(conn);
+                            }
+                            None => {
+                                return Err(SqlError::bad_value(
+                                    "autocommit",
+                                    "NULL",
+                                    "autocommit",
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.exec_stmt(s, conn)
+            }
             Stmt::CreateUser { .. } | Stmt::AlterUser { .. } | Stmt::DropUser { .. } => {
+                self.commit_txn(conn)?;
                 self.user_stmt(s)
             }
-            _ => self.run_raw(s),
+            Stmt::CreateTable(_)
+            | Stmt::DropTable { .. }
+            | Stmt::CreateIndex { .. }
+            | Stmt::DropIndex { .. } => {
+                // DDL implicitly commits (like MySQL) and needs the tables to itself.
+                self.commit_txn(conn)?;
+                if self.txns.keys().any(|c| *c != conn) {
+                    let mut e = SqlError::internal(
+                        "Lock wait timeout exceeded; another session has an open transaction (DDL waits for it to COMMIT or ROLLBACK)",
+                    );
+                    e.code = 1205;
+                    Err(e)
+                } else {
+                    // Old versions in dropped trees are gone; forget them.
+                    self.pending.clear();
+                    self.exec_stmt(s, conn)
+                }
+            }
+            _ => self.exec_stmt(s, conn),
         };
-        if let Ok(q) = &r
-            && q.last_insert_id > 0
-        {
-            sess.last_insert_id = q.last_insert_id;
+        match &r {
+            // A serialization failure rolls back the whole transaction (like InnoDB deadlocks).
+            Err(e) if e.code == 1213 => {
+                self.txns.remove(&conn);
+            }
+            Ok(q) if q.last_insert_id > 0 => sess.last_insert_id = q.last_insert_id,
+            _ => {}
         }
         r
+    }
+
+    /// Forget a connection (rolls back its open transaction).
+    pub fn end_session(&mut self, conn_id: u32) {
+        self.txns.remove(&conn_id);
+        self.manual.remove(&conn_id);
+    }
+
+    /// MySQL server status bits for a connection: IN_TRANS (1) and AUTOCOMMIT (2).
+    pub fn status(&self, conn_id: u32) -> u16 {
+        u16::from(self.txns.contains_key(&conn_id))
+            | if self.manual.contains(&conn_id) { 0 } else { 2 }
+    }
+
+    /// Number of open multi-statement transactions.
+    pub fn open_transactions(&self) -> usize {
+        self.txns.len()
+    }
+
+    fn begin_txn(&mut self, conn: u32) -> Result<()> {
+        let mut tx = self.db.begin()?;
+        let cat = catalog(&mut tx)?;
+        let snap = mvcc::last_ts(&mut tx, &cat);
+        tx.rollback();
+        self.txns.insert(
+            conn,
+            Txn {
+                snap: snap?,
+                ws: WriteSet::default(),
+            },
+        );
+        Ok(())
+    }
+
+    fn commit_txn(&mut self, conn: u32) -> Result<()> {
+        let Some(txn) = self.txns.remove(&conn) else {
+            return Ok(());
+        };
+        if txn.ws.is_empty() {
+            return Ok(());
+        }
+        let snaps: Vec<u64> = self.txns.values().map(|t| t.snap).collect();
+        let mut tx = self.db.begin()?;
+        let r = (|| {
+            let cat = catalog(&mut tx)?;
+            mvcc::commit(&mut tx, &cat, &txn.ws, txn.snap, &snaps, &mut self.pending)?;
+            gc_pending(&mut tx, &snaps, &mut self.pending)
+        })();
+        match r {
+            Ok(()) => Ok(tx.commit()?),
+            Err(e) => {
+                tx.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Run a non-transaction-control statement in the connection's transaction (or as its own
+    /// transaction in autocommit mode).
+    fn exec_stmt(&mut self, s: &Stmt, conn: u32) -> Result<QueryResult> {
+        let now = (self.clock)();
+        let starts_txn = matches!(
+            s,
+            Stmt::Select(_) | Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. }
+        );
+        let in_txn = self.txns.contains_key(&conn) || (self.manual.contains(&conn) && starts_txn);
+        let mut tx = self.db.begin()?;
+        let cat = match catalog(&mut tx) {
+            Ok(c) => c,
+            Err(e) => {
+                tx.rollback();
+                return Err(e);
+            }
+        };
+        if in_txn {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.txns.entry(conn) {
+                let snap = match mvcc::last_ts(&mut tx, &cat) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tx.rollback();
+                        return Err(e);
+                    }
+                };
+                slot.insert(Txn {
+                    snap,
+                    ws: WriteSet::default(),
+                });
+            }
+            let Some(txn) = self.txns.get_mut(&conn) else {
+                tx.rollback();
+                return Err(SqlError::internal("transaction vanished"));
+            };
+            // Statement-level atomicity inside a transaction: undo just this statement.
+            let saved = txn.ws.clone();
+            let res = {
+                let mut mv = Mv {
+                    tx: &mut tx,
+                    snap: txn.snap,
+                    ws: &mut txn.ws,
+                };
+                run_stmt(&mut mv, s, now)
+            };
+            match res {
+                // Only counters (AUTO_INCREMENT) reach storage before COMMIT.
+                Ok(r) => {
+                    tx.commit()?;
+                    Ok(r)
+                }
+                Err(e) => {
+                    txn.ws = saved;
+                    tx.rollback();
+                    Err(e)
+                }
+            }
+        } else {
+            let mut ws = WriteSet::default();
+            let res = (|| {
+                let snap = mvcc::last_ts(&mut tx, &cat)?;
+                let r = {
+                    let mut mv = Mv {
+                        tx: &mut tx,
+                        snap,
+                        ws: &mut ws,
+                    };
+                    run_stmt(&mut mv, s, now)?
+                };
+                let snaps: Vec<u64> = self.txns.values().map(|t| t.snap).collect();
+                if !ws.is_empty() {
+                    mvcc::commit(&mut tx, &cat, &ws, snap, &snaps, &mut self.pending)?;
+                    gc_pending(&mut tx, &snaps, &mut self.pending)?;
+                }
+                Ok(r)
+            })();
+            match res {
+                Ok(r) => {
+                    tx.commit()?;
+                    Ok(r)
+                }
+                Err(e) => {
+                    tx.rollback();
+                    Err(e)
+                }
+            }
+        }
     }
 
     pub fn run(&mut self, s: &Stmt) -> Result<QueryResult> {
@@ -281,64 +508,53 @@ impl Engine {
         self.default_session = sess;
         r
     }
-
-    fn run_raw(&mut self, s: &Stmt) -> Result<QueryResult> {
-        let now = (self.clock)();
-        let mut tx = self.db.begin()?;
-        let r = run_stmt(&mut tx, s, now);
-        match (&r, s) {
-            // Reads never commit.
-            (
-                Ok(_),
-                Stmt::Select(_)
-                | Stmt::ShowTables
-                | Stmt::ShowDatabases
-                | Stmt::ShowVariables { .. }
-                | Stmt::ShowWarnings
-                | Stmt::Set(_)
-                | Stmt::Use(_)
-                | Stmt::Txn(_)
-                | Stmt::Describe(_)
-                | Stmt::ShowCreateTable(_)
-                | Stmt::Explain(_),
-            ) => tx.rollback(),
-            (Ok(_), _) => tx.commit()?,
-            (Err(_), _) => tx.rollback(),
-        }
-        r
-    }
 }
 
-fn run_stmt(tx: &mut Tx<'_>, s: &Stmt, now: i64) -> Result<QueryResult> {
+/// Re-check keys whose old versions were kept for an older snapshot.
+fn gc_pending(
+    tx: &mut Tx<'_>,
+    snaps: &[u64],
+    pending: &mut HashSet<(Tree, Vec<u8>)>,
+) -> Result<()> {
+    let batch: Vec<(Tree, Vec<u8>)> = pending.iter().take(GC_BATCH).cloned().collect();
+    for (t, k) in batch {
+        if mvcc::prune(tx, &t, &k, snaps)? {
+            pending.remove(&(t, k));
+        }
+    }
+    Ok(())
+}
+
+fn run_stmt(mv: &mut Mv<'_, '_>, s: &Stmt, now: i64) -> Result<QueryResult> {
     match s {
-        Stmt::CreateTable(c) => create_table(tx, c),
-        Stmt::DropTable { names, if_exists } => drop_table(tx, names, *if_exists),
+        Stmt::CreateTable(c) => create_table(mv, c),
+        Stmt::DropTable { names, if_exists } => drop_table(mv, names, *if_exists),
         Stmt::CreateIndex {
             name,
             table,
             cols,
             unique,
-        } => create_index(tx, name, table, cols, *unique),
-        Stmt::DropIndex { name, table } => drop_index(tx, name, table),
-        Stmt::Insert { table, cols, rows } => insert(tx, table, cols.as_deref(), rows, now),
-        Stmt::Select(sel) => select(tx, sel, now),
+        } => create_index(mv, name, table, cols, *unique),
+        Stmt::DropIndex { name, table } => drop_index(mv, name, table),
+        Stmt::Insert { table, cols, rows } => insert(mv, table, cols.as_deref(), rows, now),
+        Stmt::Select(sel) => select(mv, sel, now),
         Stmt::Update {
             table,
             sets,
             filter,
             order,
             limit,
-        } => update(tx, table, sets, filter.as_ref(), order, *limit, now),
+        } => update(mv, table, sets, filter.as_ref(), order, *limit, now),
         Stmt::Delete {
             table,
             filter,
             order,
             limit,
-        } => delete(tx, table, filter.as_ref(), order, *limit, now),
-        Stmt::ShowTables => show_tables(tx),
-        Stmt::Describe(t) => describe(tx, t),
-        Stmt::ShowCreateTable(t) => show_create(tx, t),
-        Stmt::Explain(inner) => explain(tx, inner, now),
+        } => delete(mv, table, filter.as_ref(), order, *limit, now),
+        Stmt::ShowTables => show_tables(mv.tx),
+        Stmt::Describe(t) => describe(mv.tx, t),
+        Stmt::ShowCreateTable(t) => show_create(mv.tx, t),
+        Stmt::Explain(inner) => explain(mv, inner, now),
         Stmt::ShowDatabases => Ok(QueryResult {
             columns: meta(&["Database"]),
             rows: vec![vec![Value::Str("novadb".into())]],
@@ -370,10 +586,8 @@ fn run_stmt(tx: &mut Tx<'_>, s: &Stmt, now: i64) -> Result<QueryResult> {
             }
             Ok(QueryResult::ok(0))
         }
-        Stmt::Txn(TxnKind::Begin | TxnKind::Commit) => Ok(QueryResult::ok(0)),
-        Stmt::Txn(TxnKind::Rollback) => Err(SqlError::unsupported(
-            "ROLLBACK: multi-statement transactions arrive in Stage 5; every statement is committed when it finishes",
-        )),
+        // Transaction control is handled by Engine::run_in.
+        Stmt::Txn(_) => Ok(QueryResult::ok(0)),
         Stmt::CreateUser { .. } | Stmt::AlterUser { .. } | Stmt::DropUser { .. } => Err(
             SqlError::internal("user statements run through Engine::run_in"),
         ),
@@ -479,7 +693,7 @@ fn stored_chunks(stored: &[u8]) -> Result<Option<(usize, u32)>> {
 }
 
 fn decode_stored(
-    tx: &mut Tx<'_>,
+    mv: &mut Mv<'_, '_>,
     tr: &Trees,
     pk: &[u8],
     stored: &[u8],
@@ -493,7 +707,7 @@ fn decode_stored(
             }
             let mut buf = Vec::with_capacity(len);
             for i in 0..n {
-                let c = tx
+                let c = mv
                     .get(&tr.ovf, &chunk_key(pk, i))?
                     .ok_or_else(|| SqlError::corrupt("row: overflow chunk missing"))?;
                 buf.extend_from_slice(&c);
@@ -506,52 +720,52 @@ fn decode_stored(
     }
 }
 
-fn get_row(tx: &mut Tx<'_>, tr: &Trees, pk: &[u8], ncols: usize) -> Result<Option<Vec<Value>>> {
-    match tx.get(&tr.rows, pk)? {
-        Some(s) => decode_stored(tx, tr, pk, &s, ncols).map(Some),
+fn get_row(mv: &mut Mv<'_, '_>, tr: &Trees, pk: &[u8], ncols: usize) -> Result<Option<Vec<Value>>> {
+    match mv.get(&tr.rows, pk)? {
+        Some(s) => decode_stored(mv, tr, pk, &s, ncols).map(Some),
         None => Ok(None),
     }
 }
 
-fn delete_chunks(tx: &mut Tx<'_>, tr: &Trees, pk: &[u8]) -> Result<()> {
-    if let Some(old) = tx.get(&tr.rows, pk)?
+fn delete_chunks(mv: &mut Mv<'_, '_>, tr: &Trees, pk: &[u8]) -> Result<()> {
+    if let Some(old) = mv.get(&tr.rows, pk)?
         && let Some((_, n)) = stored_chunks(&old)?
     {
         for i in 0..n {
-            tx.delete(&tr.ovf, &chunk_key(pk, i))?;
+            mv.delete(&tr.ovf, &chunk_key(pk, i))?;
         }
     }
     Ok(())
 }
 
-fn put_row(tx: &mut Tx<'_>, tr: &Trees, pk: &[u8], row: &[Value]) -> Result<()> {
+fn put_row(mv: &mut Mv<'_, '_>, tr: &Trees, pk: &[u8], row: &[Value]) -> Result<()> {
     let enc = row_encode(row)?;
     if enc.len() > MAX_ROW_BYTES {
         return Err(SqlError::row_too_big());
     }
-    delete_chunks(tx, tr, pk)?;
+    delete_chunks(mv, tr, pk)?;
     if enc.len() <= INLINE_MAX {
         let mut v = Vec::with_capacity(enc.len() + 1);
         v.push(0);
         v.extend_from_slice(&enc);
-        tx.put(&tr.rows, pk, &v)?;
+        mv.put(&tr.rows, pk, &v)?;
     } else {
         let mut n = 0u32;
         for (i, c) in enc.chunks(CHUNK).enumerate() {
-            tx.put(&tr.ovf, &chunk_key(pk, i as u32), c)?;
+            mv.put(&tr.ovf, &chunk_key(pk, i as u32), c)?;
             n += 1;
         }
         let mut h = vec![1u8];
         h.extend_from_slice(&(enc.len() as u32).to_le_bytes());
         h.extend_from_slice(&n.to_le_bytes());
-        tx.put(&tr.rows, pk, &h)?;
+        mv.put(&tr.rows, pk, &h)?;
     }
     Ok(())
 }
 
-fn del_row(tx: &mut Tx<'_>, tr: &Trees, pk: &[u8]) -> Result<()> {
-    delete_chunks(tx, tr, pk)?;
-    tx.delete(&tr.rows, pk)?;
+fn del_row(mv: &mut Mv<'_, '_>, tr: &Trees, pk: &[u8]) -> Result<()> {
+    delete_chunks(mv, tr, pk)?;
+    mv.delete(&tr.rows, pk)?;
     Ok(())
 }
 
@@ -560,7 +774,8 @@ fn pk_key(t: &Table, row: &[Value]) -> Result<Vec<u8>> {
     for &c in &t.pk {
         key_encode(&mut k, &row[c], t.cols[c].ty)?;
     }
-    if k.len() > MAX_KEY_LEN - 4 {
+    // room for the overflow chunk number and the MVCC version suffix
+    if k.len() > MAX_KEY_LEN - 4 - TS_LEN {
         return Err(SqlError::key_too_long());
     }
     Ok(k)
@@ -572,18 +787,21 @@ fn hidden_key(rowid: u64) -> Result<Vec<u8>> {
     Ok(k)
 }
 
-/// (full index key, length of the indexed-columns prefix)
-fn index_key(t: &Table, ix: &Index, row: &[Value], pk: &[u8]) -> Result<(Vec<u8>, usize)> {
+/// Index entry key. Unique indexes key on the column values alone when none is NULL, so two
+/// transactions inserting the same value write the same key and the MVCC conflict check
+/// catches it; otherwise (non-unique, or NULLs) the primary key is appended.
+fn index_key(t: &Table, ix: &Index, row: &[Value], pk: &[u8]) -> Result<Vec<u8>> {
     let mut k = Vec::new();
     for &c in &ix.cols {
         key_encode(&mut k, &row[c], t.cols[c].ty)?;
     }
-    let pl = k.len();
-    k.extend_from_slice(pk);
-    if k.len() > MAX_KEY_LEN {
+    if !(ix.unique && ix.cols.iter().all(|&c| !row[c].is_null())) {
+        k.extend_from_slice(pk);
+    }
+    if k.len() > MAX_KEY_LEN - TS_LEN {
         return Err(SqlError::key_too_long());
     }
-    Ok((k, pl))
+    Ok(k)
 }
 
 fn render_key(cols: &[usize], row: &[Value]) -> String {
@@ -593,58 +811,39 @@ fn render_key(cols: &[usize], row: &[Value]) -> String {
         .join("-")
 }
 
-fn index_insert(tx: &mut Tx<'_>, t: &Table, tr: &Trees, row: &[Value], pk: &[u8]) -> Result<()> {
+fn index_insert(
+    mv: &mut Mv<'_, '_>,
+    t: &Table,
+    tr: &Trees,
+    row: &[Value],
+    pk: &[u8],
+) -> Result<()> {
     for (i, ix) in t.indexes.iter().enumerate() {
-        let (k, pl) = index_key(t, ix, row, pk)?;
-        if ix.unique && ix.cols.iter().all(|&c| !row[c].is_null()) {
-            let prefix = k[..pl].to_vec();
-            let hi = prefix_end(&prefix).map_or(Bound::Unbounded, Bound::Excluded);
-            let clash = tx
-                .range(
-                    &tr.idx[i],
-                    (
-                        Bound::Included(prefix.as_slice()),
-                        hi.as_ref().map(Vec::as_slice),
-                    ),
-                )?
-                .next()
-                .transpose()?
-                .is_some_and(|(_, other_pk)| other_pk != pk);
-            if clash {
-                return Err(SqlError::dup_entry(&render_key(&ix.cols, row), &ix.name));
-            }
+        let k = index_key(t, ix, row, pk)?;
+        if ix.unique
+            && ix.cols.iter().all(|&c| !row[c].is_null())
+            && let Some(other) = mv.get(&tr.idx[i], &k)?
+            && other != pk
+        {
+            return Err(SqlError::dup_entry(&render_key(&ix.cols, row), &ix.name));
         }
-        tx.put(&tr.idx[i], &k, pk)?;
+        mv.put(&tr.idx[i], &k, pk)?;
     }
     Ok(())
 }
 
-fn index_delete(tx: &mut Tx<'_>, t: &Table, tr: &Trees, row: &[Value], pk: &[u8]) -> Result<()> {
+fn index_delete(
+    mv: &mut Mv<'_, '_>,
+    t: &Table,
+    tr: &Trees,
+    row: &[Value],
+    pk: &[u8],
+) -> Result<()> {
     for (i, ix) in t.indexes.iter().enumerate() {
-        let (k, _) = index_key(t, ix, row, pk)?;
-        tx.delete(&tr.idx[i], &k)?;
+        let k = index_key(t, ix, row, pk)?;
+        mv.delete(&tr.idx[i], &k)?;
     }
     Ok(())
-}
-
-/// Collect up to `n` entries of `tree` within (`lo`, `hi`).
-fn batch(
-    tx: &mut Tx<'_>,
-    tree: &Tree,
-    lo: &Bound<Vec<u8>>,
-    hi: &Bound<Vec<u8>>,
-    n: usize,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let b = (
-        lo.as_ref().map(Vec::as_slice),
-        hi.as_ref().map(Vec::as_slice),
-    );
-    if let (Bound::Included(l) | Bound::Excluded(l), Bound::Included(h) | Bound::Excluded(h)) = b
-        && l > h
-    {
-        return Ok(Vec::new());
-    }
-    Ok(tx.range(tree, b)?.take(n).collect::<Result<Vec<_>, _>>()?)
 }
 
 // ----- expressions ---------------------------------------------------------------------------
@@ -1319,7 +1518,7 @@ fn plan(t: &Table, filter: Option<&Expr>, now: i64) -> Access {
 
 /// Visit matching rows in access order; `visit` returns false to stop early.
 fn scan(
-    tx: &mut Tx<'_>,
+    mv: &mut Mv<'_, '_>,
     t: &Table,
     tr: &Trees,
     access: &Access,
@@ -1345,11 +1544,11 @@ fn scan(
                 _ => (Bound::Unbounded, Bound::Unbounded),
             };
             loop {
-                let b = batch(tx, &tr.rows, &lo, &hi, SCAN_BATCH)?;
+                let b = mv.scan(&tr.rows, &lo, &hi, SCAN_BATCH)?;
                 let Some((last, _)) = b.last() else { break };
                 lo = Bound::Excluded(last.clone());
                 for (k, stored) in b {
-                    let row = decode_stored(tx, tr, &k, &stored, ncols)?;
+                    let row = decode_stored(mv, tr, &k, &stored, ncols)?;
                     if test(&row)? && !visit(k, row)? {
                         return Ok(());
                     }
@@ -1363,11 +1562,11 @@ fn scan(
                 .ok_or_else(|| SqlError::internal("index handle"))?;
             let mut lo = lo.clone();
             loop {
-                let b = batch(tx, tree, &lo, hi, SCAN_BATCH)?;
+                let b = mv.scan(tree, &lo, hi, SCAN_BATCH)?;
                 let Some((last, _)) = b.last() else { break };
                 lo = Bound::Excluded(last.clone());
                 for (_, pk) in b {
-                    let row = get_row(tx, tr, &pk, ncols)?
+                    let row = get_row(mv, tr, &pk, ncols)?
                         .ok_or_else(|| SqlError::corrupt("index entry points to a missing row"))?;
                     if test(&row)? && !visit(pk, row)? {
                         return Ok(());
@@ -1411,9 +1610,9 @@ fn col_pos(cols: &[Column], n: &str) -> Result<usize> {
         .ok_or_else(|| SqlError::bad_column(n))
 }
 
-fn create_table(tx: &mut Tx<'_>, c: &CreateTable) -> Result<QueryResult> {
+fn create_table(mv: &mut Mv<'_, '_>, c: &CreateTable) -> Result<QueryResult> {
     valid_name(&c.name)?;
-    if find_table(tx, &c.name)?.is_some() {
+    if find_table(mv.tx, &c.name)?.is_some() {
         if c.if_not_exists {
             return Ok(QueryResult {
                 info: Some(format!("Table '{}' already exists", c.name)),
@@ -1561,8 +1760,8 @@ fn create_table(tx: &mut Tx<'_>, c: &CreateTable) -> Result<QueryResult> {
     {
         return Err(SqlError::auto_inc());
     }
-    let id = read_counter(tx, b"n", 1)?;
-    write_counter(tx, b"n", id + 1)?;
+    let id = read_counter(mv.tx, b"n", 1)?;
+    write_counter(mv.tx, b"n", id + 1)?;
     let t = Table {
         id,
         name: c.name.clone(),
@@ -1571,30 +1770,30 @@ fn create_table(tx: &mut Tx<'_>, c: &CreateTable) -> Result<QueryResult> {
         indexes,
         next_index_id,
     };
-    tx.create_tree(&t.rows_tree())?;
-    tx.create_tree(&t.overflow_tree())?;
+    mv.tx.create_tree(&t.rows_tree())?;
+    mv.tx.create_tree(&t.overflow_tree())?;
     for ix in &t.indexes {
-        tx.create_tree(&t.index_tree(ix))?;
+        mv.tx.create_tree(&t.index_tree(ix))?;
     }
-    save_table(tx, &t)?;
+    save_table(mv.tx, &t)?;
     Ok(QueryResult::ok(0))
 }
 
-fn drop_table(tx: &mut Tx<'_>, names: &[String], if_exists: bool) -> Result<QueryResult> {
+fn drop_table(mv: &mut Mv<'_, '_>, names: &[String], if_exists: bool) -> Result<QueryResult> {
     let mut missing = Vec::new();
     for n in names {
-        match find_table(tx, n)? {
+        match find_table(mv.tx, n)? {
             None => missing.push(n.clone()),
             Some(t) => {
-                tx.drop_tree(&t.rows_tree())?;
-                tx.drop_tree(&t.overflow_tree())?;
+                mv.tx.drop_tree(&t.rows_tree())?;
+                mv.tx.drop_tree(&t.overflow_tree())?;
                 for ix in &t.indexes {
-                    tx.drop_tree(&t.index_tree(ix))?;
+                    mv.tx.drop_tree(&t.index_tree(ix))?;
                 }
-                let c = catalog(tx)?;
-                tx.delete(&c, &table_key(&t.name))?;
-                tx.delete(&c, &counter_key(t.id))?;
-                tx.delete(&c, &rowid_key(t.id))?;
+                let c = catalog(mv.tx)?;
+                mv.tx.delete(&c, &table_key(&t.name))?;
+                mv.tx.delete(&c, &counter_key(t.id))?;
+                mv.tx.delete(&c, &rowid_key(t.id))?;
             }
         }
     }
@@ -1605,14 +1804,14 @@ fn drop_table(tx: &mut Tx<'_>, names: &[String], if_exists: bool) -> Result<Quer
 }
 
 fn create_index(
-    tx: &mut Tx<'_>,
+    mv: &mut Mv<'_, '_>,
     name: &str,
     table: &str,
     cols: &[String],
     unique: bool,
 ) -> Result<QueryResult> {
     valid_name(name)?;
-    let mut t = load_table(tx, table)?;
+    let mut t = load_table(mv.tx, table)?;
     if name.eq_ignore_ascii_case("primary")
         || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name))
     {
@@ -1641,9 +1840,9 @@ fn create_index(
     };
     t.next_index_id += 1;
     let tree_name = t.index_tree(&ix);
-    let itree = tx.create_tree(&tree_name)?;
+    let itree = mv.tx.create_tree(&tree_name)?;
     // Build from existing rows (unique violations abort the whole statement).
-    let base = open_trees(tx, &t)?;
+    let base = open_trees(mv.tx, &t)?;
     let one = Table {
         indexes: vec![ix.clone()],
         ..t.clone()
@@ -1654,7 +1853,7 @@ fn create_index(
         idx: vec![itree],
     };
     let mut rows = Vec::new();
-    scan(tx, &t, &tr, &Access::Full, None, 0, |pk, row| {
+    scan(mv, &t, &tr, &Access::Full, None, 0, |pk, row| {
         rows.push((pk, row));
         if rows.len() > MAX_ROWS_IN_MEMORY {
             return Err(SqlError::resource(
@@ -1664,15 +1863,15 @@ fn create_index(
         Ok(true)
     })?;
     for (pk, row) in &rows {
-        index_insert(tx, &one, &tr, row, pk)?;
+        index_insert(mv, &one, &tr, row, pk)?;
     }
     t.indexes.push(ix);
-    save_table(tx, &t)?;
+    save_table(mv.tx, &t)?;
     Ok(QueryResult::ok(0))
 }
 
-fn drop_index(tx: &mut Tx<'_>, name: &str, table: &str) -> Result<QueryResult> {
-    let mut t = load_table(tx, table)?;
+fn drop_index(mv: &mut Mv<'_, '_>, name: &str, table: &str) -> Result<QueryResult> {
+    let mut t = load_table(mv.tx, table)?;
     let Some(pos) = t
         .indexes
         .iter()
@@ -1687,28 +1886,28 @@ fn drop_index(tx: &mut Tx<'_>, name: &str, table: &str) -> Result<QueryResult> {
     {
         return Err(SqlError::auto_inc());
     }
-    tx.drop_tree(&t.index_tree(&ix))?;
-    save_table(tx, &t)?;
+    mv.tx.drop_tree(&t.index_tree(&ix))?;
+    save_table(mv.tx, &t)?;
     Ok(QueryResult::ok(0))
 }
 
 // ----- DML -----------------------------------------------------------------------------------
 
 /// Store `row` as a new row (PK / unique checks, indexes). Returns the primary key.
-fn insert_row(tx: &mut Tx<'_>, t: &Table, tr: &Trees, row: &[Value]) -> Result<Vec<u8>> {
+fn insert_row(mv: &mut Mv<'_, '_>, t: &Table, tr: &Trees, row: &[Value]) -> Result<Vec<u8>> {
     let pk = if t.pk.is_empty() {
-        let id = read_counter(tx, &rowid_key(t.id), 1)?;
-        write_counter(tx, &rowid_key(t.id), id + 1)?;
+        let id = read_counter(mv.tx, &rowid_key(t.id), 1)?;
+        write_counter(mv.tx, &rowid_key(t.id), id + 1)?;
         hidden_key(id)?
     } else {
         let k = pk_key(t, row)?;
-        if tx.get(&tr.rows, &k)?.is_some() {
+        if mv.get(&tr.rows, &k)?.is_some() {
             return Err(SqlError::dup_entry(&render_key(&t.pk, row), "PRIMARY"));
         }
         k
     };
-    index_insert(tx, t, tr, row, &pk)?;
-    put_row(tx, tr, &pk, row)?;
+    index_insert(mv, t, tr, row, &pk)?;
+    put_row(mv, tr, &pk, row)?;
     Ok(pk)
 }
 
@@ -1722,14 +1921,14 @@ fn finish_row(t: &Table, row: &mut [Value]) -> Result<()> {
 }
 
 fn insert(
-    tx: &mut Tx<'_>,
+    mv: &mut Mv<'_, '_>,
     table: &str,
     cols: Option<&[String]>,
     rows: &[Vec<Expr>],
     now: i64,
 ) -> Result<QueryResult> {
-    let t = load_table(tx, table)?;
-    let tr = open_trees(tx, &t)?;
+    let t = load_table(mv.tx, table)?;
+    let tr = open_trees(mv.tx, &t)?;
     let targets: Vec<usize> = match cols {
         None => (0..t.cols.len()).collect(),
         Some(names) => {
@@ -1746,7 +1945,7 @@ fn insert(
     };
     let ai = t.auto_inc_col();
     let mut counter = match ai {
-        Some(_) => Some(read_counter(tx, &counter_key(t.id), 1)?),
+        Some(_) => Some(read_counter(mv.tx, &counter_key(t.id), 1)?),
         None => None,
     };
     let mut first_id = 0u64;
@@ -1814,11 +2013,11 @@ fn insert(
             }
         }
         finish_row(&t, &mut row)?;
-        insert_row(tx, &t, &tr, &row)?;
+        insert_row(mv, &t, &tr, &row)?;
         n += 1;
     }
     if let (Some(_), Some(ctr)) = (ai, counter) {
-        write_counter(tx, &counter_key(t.id), ctr)?;
+        write_counter(mv.tx, &counter_key(t.id), ctr)?;
     }
     Ok(QueryResult {
         affected: n,
@@ -1871,7 +2070,7 @@ fn cmp_keys(a: &[Value], b: &[Value], order: &[OrderBy]) -> Ordering {
 }
 
 fn collect(
-    tx: &mut Tx<'_>,
+    mv: &mut Mv<'_, '_>,
     t: &Table,
     tr: &Trees,
     filter: Option<&Expr>,
@@ -1895,7 +2094,7 @@ fn collect(
     if cap == Some(0) {
         return Ok(rows);
     }
-    scan(tx, t, tr, &access, filter, now, |pk, row| {
+    scan(mv, t, tr, &access, filter, now, |pk, row| {
         rows.push((pk, row));
         if rows.len() > MAX_ROWS_IN_MEMORY {
             return Err(SqlError::resource(
@@ -1912,7 +2111,7 @@ fn collect(
 }
 
 fn update(
-    tx: &mut Tx<'_>,
+    mv: &mut Mv<'_, '_>,
     table: &str,
     sets: &[(String, Expr)],
     filter: Option<&Expr>,
@@ -1920,15 +2119,15 @@ fn update(
     limit: Option<u64>,
     now: i64,
 ) -> Result<QueryResult> {
-    let t = load_table(tx, table)?;
-    let tr = open_trees(tx, &t)?;
+    let t = load_table(mv.tx, table)?;
+    let tr = open_trees(mv.tx, &t)?;
     let mut targets = Vec::with_capacity(sets.len());
     for (c, e) in sets {
         let i = t.col(c).ok_or_else(|| SqlError::bad_column(c))?;
         check_cols(e, Some(&t))?;
         targets.push((i, e));
     }
-    let rows = collect(tx, &t, &tr, filter, order, limit, now)?;
+    let rows = collect(mv, &t, &tr, filter, order, limit, now)?;
     let mut changed = 0u64;
     let matched = rows.len();
     for (pk, old) in rows {
@@ -1953,15 +2152,15 @@ fn update(
         } else {
             pk_key(&t, &new)?
         };
-        index_delete(tx, &t, &tr, &old, &pk)?;
+        index_delete(mv, &t, &tr, &old, &pk)?;
         if new_pk != pk {
-            if tx.get(&tr.rows, &new_pk)?.is_some() {
+            if mv.get(&tr.rows, &new_pk)?.is_some() {
                 return Err(SqlError::dup_entry(&render_key(&t.pk, &new), "PRIMARY"));
             }
-            del_row(tx, &tr, &pk)?;
+            del_row(mv, &tr, &pk)?;
         }
-        index_insert(tx, &t, &tr, &new, &new_pk)?;
-        put_row(tx, &tr, &new_pk, &new)?;
+        index_insert(mv, &t, &tr, &new, &new_pk)?;
+        put_row(mv, &tr, &new_pk, &new)?;
         changed += 1;
     }
     Ok(QueryResult {
@@ -1974,20 +2173,20 @@ fn update(
 }
 
 fn delete(
-    tx: &mut Tx<'_>,
+    mv: &mut Mv<'_, '_>,
     table: &str,
     filter: Option<&Expr>,
     order: &[OrderBy],
     limit: Option<u64>,
     now: i64,
 ) -> Result<QueryResult> {
-    let t = load_table(tx, table)?;
-    let tr = open_trees(tx, &t)?;
-    let rows = collect(tx, &t, &tr, filter, order, limit, now)?;
+    let t = load_table(mv.tx, table)?;
+    let tr = open_trees(mv.tx, &t)?;
+    let rows = collect(mv, &t, &tr, filter, order, limit, now)?;
     let n = rows.len() as u64;
     for (pk, row) in rows {
-        index_delete(tx, &t, &tr, &row, &pk)?;
-        del_row(tx, &tr, &pk)?;
+        index_delete(mv, &t, &tr, &row, &pk)?;
+        del_row(mv, &tr, &pk)?;
     }
     Ok(QueryResult::ok(n))
 }
@@ -1999,9 +2198,9 @@ enum Item<'a> {
     Expr(&'a Expr),
 }
 
-fn select(tx: &mut Tx<'_>, s: &Select, now: i64) -> Result<QueryResult> {
+fn select(mv: &mut Mv<'_, '_>, s: &Select, now: i64) -> Result<QueryResult> {
     let t = match &s.from {
-        Some(name) => Some(load_table(tx, name)?),
+        Some(name) => Some(load_table(mv.tx, name)?),
         None => None,
     };
     // Resolve select list.
@@ -2106,13 +2305,13 @@ fn select(tx: &mut Tx<'_>, s: &Select, now: i64) -> Result<QueryResult> {
             vec![project(&[], None)?]
         }
         Some(t) => {
-            let tr = open_trees(tx, t)?;
+            let tr = open_trees(mv.tx, t)?;
             let need = if s.distinct {
                 None
             } else {
                 s.limit.map(|l| l.saturating_add(s.offset))
             };
-            let rows = collect(tx, t, &tr, s.filter.as_ref(), &order, need, now)?;
+            let rows = collect(mv, t, &tr, s.filter.as_ref(), &order, need, now)?;
             rows.iter()
                 .map(|(_, r)| project(r, Some(t)))
                 .collect::<Result<_>>()?
@@ -2285,7 +2484,7 @@ fn show_create(tx: &mut Tx<'_>, name: &str) -> Result<QueryResult> {
     })
 }
 
-fn explain(tx: &mut Tx<'_>, s: &Stmt, now: i64) -> Result<QueryResult> {
+fn explain(mv: &mut Mv<'_, '_>, s: &Stmt, now: i64) -> Result<QueryResult> {
     let (table, filter) = match s {
         Stmt::Select(sel) => (sel.from.as_deref(), sel.filter.as_ref()),
         Stmt::Update { table, filter, .. } | Stmt::Delete { table, filter, .. } => {
@@ -2300,7 +2499,7 @@ fn explain(tx: &mut Tx<'_>, s: &Stmt, now: i64) -> Result<QueryResult> {
             Value::Null,
         ],
         Some(name) => {
-            let t = load_table(tx, name)?;
+            let t = load_table(mv.tx, name)?;
             if let Some(f) = filter {
                 check_cols(f, Some(&t))?;
             }

@@ -1039,7 +1039,7 @@ async fn overview(
             "done",
         ),
         ("4", "MySQL wire protocol over TLS (127.0.0.1:3307)", "done"),
-        ("5", "Transactions (MVCC)", "planned"),
+        ("5", "Transactions: MVCC, snapshot isolation", "done"),
         ("6", "Joins, aggregates, planner", "planned"),
         ("7", "Ops: backups, PITR, metrics", "planned"),
         ("8", "Replication / Raft cluster", "planned"),

@@ -94,7 +94,7 @@ pub async fn handle(server: Arc<Server>, tcp: TcpStream, peer: SocketAddr, conn_
             return;
         }
     };
-    if let Err(e) = command_loop(
+    let r = command_loop(
         &server,
         &mut tls,
         Session {
@@ -104,7 +104,10 @@ pub async fn handle(server: Arc<Server>, tcp: TcpStream, peer: SocketAddr, conn_
         },
         caps,
     )
-    .await
+    .await;
+    // Whatever the client left open is rolled back (like MySQL on disconnect).
+    server.end_session(conn_id).await;
+    if let Err(e) = r
         && e.kind() != io::ErrorKind::UnexpectedEof
     {
         eprintln!("[novadb] {peer}: connection error: {e}");
@@ -229,6 +232,7 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
     let mut multi = caps & pk::CLIENT_MULTI_STATEMENTS != 0;
     let mut prepared: HashMap<u32, Prepared> = HashMap::new();
     let mut next_stmt = 1u32;
+    let mut status = pk::SERVER_STATUS_AUTOCOMMIT;
     loop {
         let (_, p) =
             match tokio::time::timeout(IDLE_TIMEOUT, read_packet(s, server.max_packet)).await {
@@ -241,11 +245,11 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
         let mut w = Writer::new(1);
         match cmd {
             pk::COM_QUIT => return Ok(()),
-            pk::COM_PING => w.push(&pk::ok(0, 0, pk::SERVER_STATUS_AUTOCOMMIT, "", false)),
+            pk::COM_PING => w.push(&pk::ok(0, 0, status, "", false)),
             pk::COM_INIT_DB => {
                 let db = String::from_utf8_lossy(body);
                 if db.eq_ignore_ascii_case("novadb") {
-                    w.push(&pk::ok(0, 0, pk::SERVER_STATUS_AUTOCOMMIT, "", false));
+                    w.push(&pk::ok(0, 0, status, "", false));
                 } else {
                     w.push(&sql_err(&SqlError::unknown_db(&db)));
                 }
@@ -260,12 +264,12 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     Some(1) => multi = false,
                     _ => {}
                 }
-                w.push(&pk::eof(pk::SERVER_STATUS_AUTOCOMMIT));
+                w.push(&pk::eof(status));
             }
             pk::COM_RESET_CONNECTION => {
                 prepared.clear();
                 sess.last_insert_id = 0;
-                w.push(&pk::ok(0, 0, pk::SERVER_STATUS_AUTOCOMMIT, "", false));
+                w.push(&pk::ok(0, 0, status, "", false));
             }
             pk::COM_QUERY => {
                 let Ok(sql) = std::str::from_utf8(body) else {
@@ -292,8 +296,12 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                         let n = stmts.len();
                         for (i, st) in stmts.into_iter().enumerate() {
                             let more = i + 1 < n;
-                            match server.run(st, &mut sess).await {
-                                Ok(r) => write_result(&mut w, &r, more, deprecate_eof, false),
+                            let (res, st_bits) = server.run(st, &mut sess).await;
+                            status = st_bits;
+                            match res {
+                                Ok(r) => {
+                                    write_result(&mut w, &r, more, deprecate_eof, false, status)
+                                }
                                 Err(e) => {
                                     w.push(&sql_err(&e));
                                     break;
@@ -333,7 +341,7 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                                 }));
                             }
                             if n > 0 && !deprecate_eof {
-                                w.push(&pk::eof(pk::SERVER_STATUS_AUTOCOMMIT));
+                                w.push(&pk::eof(status));
                             }
                             let stmt = stmts.remove(0);
                             prepared.insert(
@@ -382,7 +390,7 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
             {
                 Some(p) => {
                     p.long_data.clear();
-                    w.push(&pk::ok(0, 0, pk::SERVER_STATUS_AUTOCOMMIT, "", false));
+                    w.push(&pk::ok(0, 0, status, "", false));
                 }
                 None => w.push(&pk::err(
                     1243,
@@ -415,12 +423,21 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                                     let mut st = p.stmt.clone();
                                     match novadb_sql::bind_params(&mut st, &vals) {
                                         Err(e) => w.push(&sql_err(&e)),
-                                        Ok(()) => match server.run(st, &mut sess).await {
-                                            Ok(r) => {
-                                                write_result(&mut w, &r, false, deprecate_eof, true)
+                                        Ok(()) => {
+                                            let (res, st_bits) = server.run(st, &mut sess).await;
+                                            status = st_bits;
+                                            match res {
+                                                Ok(r) => write_result(
+                                                    &mut w,
+                                                    &r,
+                                                    false,
+                                                    deprecate_eof,
+                                                    true,
+                                                    status,
+                                                ),
+                                                Err(e) => w.push(&sql_err(&e)),
                                             }
-                                            Err(e) => w.push(&sql_err(&e)),
-                                        },
+                                        }
                                     }
                                 }
                             }
@@ -439,8 +456,15 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-fn write_result(w: &mut Writer, r: &QueryResult, more: bool, deprecate_eof: bool, binary: bool) {
-    let status = pk::SERVER_STATUS_AUTOCOMMIT
+fn write_result(
+    w: &mut Writer,
+    r: &QueryResult,
+    more: bool,
+    deprecate_eof: bool,
+    binary: bool,
+    base: u16,
+) {
+    let status = base
         | if more {
             pk::SERVER_MORE_RESULTS_EXISTS
         } else {

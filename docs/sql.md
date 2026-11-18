@@ -49,7 +49,7 @@ running random workloads against an indexed and an unindexed copy of the same ta
 
 ## Limits / not yet (by design, later stages)
 * No joins, GROUP BY / aggregates, subqueries, HAVING (Stage 6); no ALTER TABLE yet.
-* No multi-statement transactions — `BEGIN/COMMIT` and MVCC are Stage 5. One writer at a time.
+* Multi-statement transactions: see [transactions.md](transactions.md) (Stage 5, snapshot isolation). Statements execute one at a time.
 * Sorting and UPDATE/DELETE candidate sets are in memory, capped at 1,000,000 rows
   (`MAX_ROWS_IN_MEMORY`); disk spill arrives with the Stage 6 planner.
 * Collation is binary (case-sensitive `'a' <> 'A'`); MySQL's default is case-insensitive.

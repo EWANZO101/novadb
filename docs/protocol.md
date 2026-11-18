@@ -56,9 +56,9 @@ utf8mb4, strict mode, autocommit), `SET TRANSACTION …`, `USE`, `SHOW DATABASES
 (`@@version_comment`, `@@max_allowed_packet`, `@@autocommit`, …), `CURRENT_USER()`,
 `CONNECTION_ID()`, `LAST_INSERT_ID()`, `?` placeholders.
 
-`BEGIN`/`START TRANSACTION`/`COMMIT` are accepted (every statement already commits on its own);
-**`ROLLBACK` returns an error** instead of pretending — real multi-statement transactions are
-Stage 5.
+Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`, `SET autocommit=0`) are real since Stage 5 — see
+[transactions.md](transactions.md). OK packets carry the IN_TRANS / AUTOCOMMIT status bits and a
+disconnect rolls back.
 
 ## Tested with
 * `mariadb` command-line client (TLS with `--ssl-ca`, batch + interactive).

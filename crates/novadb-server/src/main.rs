@@ -48,21 +48,40 @@ pub struct Server {
 }
 
 impl Server {
-    /// Execute one statement on the blocking pool (single writer engine).
-    async fn run(&self, st: Stmt, sess: &mut Session) -> Result<QueryResult, SqlError> {
+    /// Execute one statement on the blocking pool (single writer engine). Returns the result
+    /// and the connection's server status bits (IN_TRANS / AUTOCOMMIT).
+    async fn run(&self, st: Stmt, sess: &mut Session) -> (Result<QueryResult, SqlError>, u16) {
         let eng = self.engine.clone();
         let mut s = sess.clone();
-        let (r, s) = tokio::task::spawn_blocking(move || {
-            let r = match eng.lock() {
-                Ok(mut e) => e.run_in(&st, &mut s),
-                Err(_) => Err(SqlError::internal("engine lock poisoned")),
+        let joined = tokio::task::spawn_blocking(move || {
+            let (r, status) = match eng.lock() {
+                Ok(mut e) => {
+                    let r = e.run_in(&st, &mut s);
+                    (r, e.status(s.conn_id))
+                }
+                Err(_) => (Err(SqlError::internal("engine lock poisoned")), 2),
             };
-            (r, s)
+            (r, status, s)
         })
-        .await
-        .map_err(|e| SqlError::internal(format!("task: {e}")))?;
-        *sess = s;
-        r
+        .await;
+        match joined {
+            Ok((r, status, s)) => {
+                *sess = s;
+                (r, status)
+            }
+            Err(e) => (Err(SqlError::internal(format!("task: {e}"))), 2),
+        }
+    }
+
+    /// Roll back whatever the connection left open.
+    async fn end_session(&self, conn_id: u32) {
+        let eng = self.engine.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(mut e) = eng.lock() {
+                e.end_session(conn_id);
+            }
+        })
+        .await;
     }
 
     /// Verify a password. Unknown users are checked against a dummy hash so timing does not

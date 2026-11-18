@@ -5,6 +5,31 @@ All builds and tests run **inside Docker** (`novadb-builder`, `--cpus 2 --memory
 Toolchain: rustc 1.100.0 stable, nightly 2026-11-11 for cargo-fuzz; cargo-deny 0.20.2,
 cargo-audit 0.23.0, cargo-nextest 0.9.152.
 
+## 2026-11-18 — Stage 5 (transactions: MVCC, snapshot isolation)
+Details: [docs/transactions.md](docs/transactions.md). No new dependencies.
+
+| check | result |
+|---|---|
+| all earlier tests on versioned storage (SQL 20 + 10, protocol 9, server 3, storage …) | ✅ |
+| `tests/txn.rs` (8 tests) | ✅ |
+| randomised SI checker, 12,000 steps × 6 seeds (default, 1, 7, 42, 1337, 987654321) | ✅ |
+| Node `mysql2` over TLS: transactions 11/11, regression 20/20 | ✅ |
+| clippy `-D warnings` workspace | ✅ |
+| fresh-clone suite on Stage 4 commit 8e45a7a | ✅ 20/20 steps |
+
+Bugs found while building (all caught by the tests before commit):
+1. Pruning kept every version newer than the oldest snapshot instead of only what each open
+   snapshot can see (11 versions instead of 2) — now per-snapshot.
+2. The SI checker found that dropping a deletion marker too early hid a write-write conflict
+   from an older transaction (an INSERT that should have got 1213 succeeded). The newest version
+   now stays until no open snapshot predates it.
+3. The checker flagged an "unexpected" 1213 that turned out to be correct: a transaction that
+   had already lost the race on a row was told early (via an index entry the winner committed)
+   instead of at COMMIT. The model now accepts early detection for doomed transactions.
+
+Not done in this stage: SERIALIZABLE (write skew possible), SELECT … FOR UPDATE, savepoints,
+group commit, idle-in-transaction timeout.
+
 ## 2026-11-18 — Stage 4 (MySQL wire protocol over TLS)
 Details: [docs/protocol.md](docs/protocol.md). New deps: tokio, tokio-rustls/rustls (ring), rcgen, argon2.
 
