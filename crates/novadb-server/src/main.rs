@@ -14,6 +14,8 @@
 mod auth;
 mod conn;
 mod ops;
+mod rest;
+mod tokens;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -262,16 +264,31 @@ struct Config {
     metrics: Option<SocketAddr>,
     metrics_token: Option<String>,
     no_binlog: bool,
+    rest: Option<SocketAddr>,
+}
+
+/// Lower-case hex.
+pub(crate) fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 const USAGE: &str = "usage:
   novadb-server --data-dir DIR [--listen 127.0.0.1:3307] [--tls-cert FILE --tls-key FILE]
                 [--backup-key FILE] [--metrics 127.0.0.1:9104] [--metrics-token-file FILE] [--no-binlog]
+                [--rest 127.0.0.1:3380]
+  novadb-server token create|list|revoke …   (REST/WebSocket API tokens; `token` alone for help)
+  novadb-server query add|list|remove …      (saved queries for the REST `query` scope)
   novadb-server --restore BACKUP.nbk --data-dir NEW_DIR --backup-key FILE [--binlog-dir DIR] [--until 'YYYY-MM-DD HH:MM:SS']
   novadb-server --gen-backup-key FILE
   novadb-server --version";
 
 fn parse_args() -> Result<Option<Config>, String> {
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(kind) = all.first().filter(|k| *k == "token" || *k == "query") {
+        println!("{}", tokens::cli(kind, &all[1..])?);
+        return Ok(None);
+    }
+    let mut rest: Option<String> = None;
     let mut args = std::env::args().skip(1);
     let (mut dir, mut listen, mut cert, mut key) = (None, None, None, None);
     let (mut bkey, mut metrics, mut mtoken, mut no_binlog) = (None, None, None, false);
@@ -296,6 +313,7 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--metrics" => metrics = args.next(),
             "--metrics-token-file" => mtoken = args.next(),
             "--no-binlog" => no_binlog = true,
+            "--rest" => rest = args.next(),
             "--restore" => restore = args.next(),
             "--binlog-dir" => binlog_dir = args.next(),
             "--until" => until = args.next(),
@@ -337,7 +355,21 @@ fn parse_args() -> Result<Option<Config>, String> {
         ),
         None => None,
     };
+    let rest: Option<SocketAddr> = match rest {
+        Some(r) => {
+            let a: SocketAddr = r.parse().map_err(|e| format!("--rest: {e}"))?;
+            if !a.ip().is_loopback() {
+                return Err(
+                    "--rest serves plain HTTP: loopback addresses only (put nginx/TLS in front)"
+                        .into(),
+                );
+            }
+            Some(a)
+        }
+        None => None,
+    };
     Ok(Some(Config {
+        rest,
         data_dir,
         listen,
         tls_cert: cert.map(PathBuf::from),
@@ -525,6 +557,16 @@ fn run(cfg: Config) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     bootstrap(&mut engine, &cfg.data_dir)?;
+    // Change feed for WebSocket subscribers (only cloned while someone listens).
+    let (feed, _) = tokio::sync::broadcast::channel::<rest::Changes>(1024);
+    {
+        let feed = feed.clone();
+        engine.set_change_hook(Box::new(move |ops| {
+            if feed.receiver_count() > 0 {
+                let _ = feed.send(Arc::new(ops.to_vec()));
+            }
+        }));
+    }
     let tls = tls_config(&cfg)?;
     let server = Arc::new(Server {
         engine: Arc::new(Mutex::new(engine)),
@@ -556,6 +598,9 @@ fn run(cfg: Config) -> Result<(), String> {
             addr,
             cfg.metrics_token.clone(),
         ));
+    }
+    if let Some(addr) = cfg.rest {
+        rt.spawn(rest::serve(rest::api(server.clone(), feed.clone()), addr));
     }
     rt.block_on(serve(server.clone(), cfg.listen))?;
     rt.shutdown_timeout(Duration::from_secs(5));

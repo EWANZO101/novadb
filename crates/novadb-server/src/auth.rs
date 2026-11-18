@@ -65,6 +65,13 @@ impl RateLimiter {
         }
     }
 
+    /// Forget a key's count (e.g. after a successful login).
+    pub fn forgive(&self, key: &str) {
+        if let Ok(mut m) = self.map.lock() {
+            m.remove(key);
+        }
+    }
+
     pub fn hit(&self, key: &str, max: u32, window: Duration) -> bool {
         let Ok(mut m) = self.map.lock() else {
             return false;

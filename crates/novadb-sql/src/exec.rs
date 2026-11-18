@@ -120,7 +120,12 @@ pub struct Engine {
     deferred: Option<Vec<Record>>,
     /// Online ALTER TABLE in progress.
     alter: Option<alter::Job>,
+    /// Called with the logical changes of every durable commit (change feeds).
+    hook: Option<ChangeHook>,
 }
+
+/// Receives the logical changes (rows put/deleted, DDL text, …) of each durable commit.
+pub type ChangeHook = Box<dyn Fn(&[LogOp]) + Send>;
 
 /// Append to the binlog, or hold the record back while a transactional-DDL transaction is open.
 fn log_rec(
@@ -129,12 +134,12 @@ fn log_rec(
     r: Record,
 ) -> Result<()> {
     match (binlog.as_mut(), deferred.as_mut()) {
-        (Some(_), Some(d)) => {
+        (_, Some(d)) => {
             d.push(r);
             Ok(())
         }
         (Some(b), None) => b.append(&r),
-        (None, _) => Ok(()),
+        (None, None) => Ok(()),
     }
 }
 
@@ -172,6 +177,7 @@ impl Engine {
             ddl_owner: None,
             deferred: None,
             alter: None,
+            hook: None,
         })
         .after_open()
     }
@@ -189,6 +195,7 @@ impl Engine {
             ddl_owner: None,
             deferred: None,
             alter: None,
+            hook: None,
         })
         .after_open()
     }
@@ -587,6 +594,10 @@ impl Engine {
         })();
         if r.is_err() {
             self.db.rollback_outer();
+        } else {
+            for rec in &recs {
+                self.emit(&rec.ops);
+            }
         }
         r
     }
@@ -624,7 +635,11 @@ impl Engine {
             Ok(())
         })();
         match r {
-            Ok(()) => Ok(tx.commit()?),
+            Ok(()) => {
+                tx.commit()?;
+                self.emit(&txn.ws.log);
+                Ok(())
+            }
             Err(e) => {
                 tx.rollback();
                 Err(e)
@@ -694,6 +709,7 @@ impl Engine {
             }
         } else {
             let mut ws = WriteSet::default();
+            let mut emitted = Vec::new();
             let res = (|| {
                 let snap = mvcc::last_ts(&mut tx, &cat)?;
                 let r = {
@@ -711,6 +727,9 @@ impl Engine {
                     if let Some(j) = self.alter.as_mut() {
                         alter::note(j, &ws.log);
                     }
+                    if self.hook.is_some() && self.deferred.is_none() {
+                        emitted = ws.log.clone();
+                    }
                     log_rec(
                         &mut self.binlog,
                         &mut self.deferred,
@@ -726,6 +745,7 @@ impl Engine {
             match res {
                 Ok(r) => {
                     tx.commit()?;
+                    self.emit(&emitted);
                     Ok(r)
                 }
                 Err(e) => {
@@ -3071,6 +3091,26 @@ impl Engine {
         r
     }
 
+    /// Call `f` with the logical changes of every durable commit (after it is on disk; for a
+    /// transaction with DDL, at its COMMIT). Must be quick and must not call back into the engine.
+    pub fn set_change_hook(&mut self, f: ChangeHook) {
+        self.hook = Some(f);
+    }
+
+    /// Binlog or change hook wants logical records.
+    fn logging(&self) -> bool {
+        self.binlog.is_some() || self.hook.is_some()
+    }
+
+    fn emit(&self, ops: &[LogOp]) {
+        if self.deferred.is_none()
+            && !ops.is_empty()
+            && let Some(h) = &self.hook
+        {
+            h(ops);
+        }
+    }
+
     /// Start a new binlog file (done at every backup).
     pub fn rotate_binlog(&mut self) -> Result<()> {
         match self.binlog.as_mut() {
@@ -3081,9 +3121,14 @@ impl Engine {
 
     /// Log non-row changes (DDL, users) under a fresh timestamp.
     fn log_now(&mut self, ops: Vec<LogOp>) -> Result<()> {
-        if self.binlog.is_none() || ops.is_empty() {
+        if !self.logging() || ops.is_empty() {
             return Ok(());
         }
+        let emitted = if self.hook.is_some() {
+            ops.clone()
+        } else {
+            Vec::new()
+        };
         let wall = (self.clock)();
         let mut tx = self.db.begin()?;
         let r = (|| {
@@ -3102,7 +3147,11 @@ impl Engine {
             Ok(())
         })();
         match r {
-            Ok(()) => Ok(tx.commit()?),
+            Ok(()) => {
+                tx.commit()?;
+                self.emit(&emitted);
+                Ok(())
+            }
             Err(e) => {
                 tx.rollback();
                 Err(e)
@@ -3153,7 +3202,7 @@ impl Engine {
     }
 
     fn log_after(&mut self, s: &Stmt) -> Result<()> {
-        if self.binlog.is_none() {
+        if !self.logging() {
             return Ok(());
         }
         let ops = match s {

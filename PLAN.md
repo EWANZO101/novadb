@@ -39,7 +39,7 @@ No "MySQL compatible" / "high availability" / "fast" claims until the matching t
 - ✅ **Stage 7 — ops**: Docker image, systemd unit, backup/restore + PITR, Prometheus metrics.
 - ⏳ **Stage 8 — replication/cluster (custom Raft)**: 3-node, leader election, log replication, join tokens, mTLS, partition tests (Jepsen-style).
 - 🟡 **Stage 9 — Control dashboard + Identity** (Argon2id, TOTP, passkeys, Discord/GitHub OAuth, audit log). *(Live at the dashboard; passkeys not done yet — docs/dashboard.md.)*
-- ⏳ **Stage 10 — REST/WebSocket + SDKs**, then website/docs.
+- ✅ **Stage 10 — REST/WebSocket + SDKs**: token-scoped REST CRUD, saved queries, opt-in SQL, WebSocket queries/transactions/live change feed, JS + Python SDKs ([docs/rest.md](docs/rest.md)). Website: later.
 **Later / separate project**: Windows installer, Kubernetes/Helm, NovaDB Cloud + billing, stored procedures, triggers, LSM engine.
 
 ## 4. Security review of the spec — issues & fixes

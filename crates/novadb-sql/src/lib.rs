@@ -31,7 +31,7 @@ pub mod value;
 
 pub use ast::bind_params;
 pub use error::{Result, SqlError};
-pub use exec::{ColumnMeta, Engine, QueryResult, Session, set_cancel_flag};
+pub use exec::{ChangeHook, ColumnMeta, Engine, QueryResult, Session, set_cancel_flag};
 pub use parser::{parse, parse_prepared};
 pub use value::{ColType, Value};
 

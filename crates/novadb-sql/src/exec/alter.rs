@@ -809,7 +809,7 @@ impl Engine {
     }
 
     fn log_alter(&mut self, name: &str, actions: &[AlterAction]) -> Result<()> {
-        if self.binlog.is_some() {
+        if self.logging() {
             self.log_now(vec![LogOp::Ddl(alter_text(name, actions))])?;
         }
         Ok(())
@@ -926,7 +926,7 @@ impl Engine {
                 }
                 self.pending.clear();
                 if let Some(text) = job.stmt_text.take()
-                    && self.binlog.is_some()
+                    && self.logging()
                 {
                     self.log_now(vec![LogOp::Ddl(text)])?;
                 }
