@@ -5,6 +5,23 @@ All builds and tests run **inside Docker** (`novadb-builder`, `--cpus 2 --memory
 Toolchain: rustc 1.100.0 stable, nightly 2026-11-11 for cargo-fuzz; cargo-deny 0.20.2,
 cargo-audit 0.23.0, cargo-nextest 0.9.152.
 
+## 2026-11-18 — Stage 6 (joins, aggregates, subqueries, KILL)
+Details: [docs/sql.md](docs/sql.md) (Queries / Aggregates / Subqueries / Planner).
+
+| check | result |
+|---|---|
+| `tests/query.rs` (5 tests) incl. randomised join-vs-brute-force differential test (120 rounds of INNER/LEFT joins with ON/WHERE variations + grouped HAVING variant) | ✅ |
+| all earlier tests (SQL 20+10+8, protocol, server, storage) | ✅ |
+| Node `mysql2`: Stage 6 7/7 (prepared LEFT JOIN + GROUP BY, IN-subquery with a parameter, SHOW PROCESSLIST, live KILL QUERY of a running join → 1317, KILL closes the connection, max_execution_time → 3024), transactions 11/11, regression 20/20 | ✅ |
+| clippy `-D warnings` workspace | ✅ |
+
+Found while building: an aggregate in WHERE reported "unknown function" (1582) instead of
+"Invalid use of group function" (1111); my AVG(DECIMAL) test expectation had the wrong scale
+(NovaDB matches MySQL's scale + 4).
+
+Not done: correlated subqueries, UNION, derived tables, window functions, join reordering
+(nested loops in FROM order), disk spill for big sorts/joins (1M-row in-memory cap).
+
 ## 2026-11-18 — Stage 5 (transactions: MVCC, snapshot isolation)
 Details: [docs/transactions.md](docs/transactions.md). No new dependencies.
 

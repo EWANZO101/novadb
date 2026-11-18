@@ -35,8 +35,19 @@ pub const INITIAL_PW_FILE: &str = "initial-root-password.txt";
 const MAX_CONNECTIONS: usize = 256;
 const MAX_PER_IP: usize = 32;
 
+/// A live, authenticated connection (for KILL / SHOW PROCESSLIST).
+pub struct ConnInfo {
+    pub user: String,
+    pub host: String,
+    pub since: Instant,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub closing: Arc<std::sync::atomic::AtomicBool>,
+    pub info: Mutex<Option<String>>,
+}
+
 pub struct Server {
     engine: Arc<Mutex<Engine>>,
+    conns: Mutex<HashMap<u32, Arc<ConnInfo>>>,
     tls: TlsAcceptor,
     limiter: auth::RateLimiter,
     hash_sem: tokio::sync::Semaphore,
@@ -53,7 +64,12 @@ impl Server {
     async fn run(&self, st: Stmt, sess: &mut Session) -> (Result<QueryResult, SqlError>, u16) {
         let eng = self.engine.clone();
         let mut s = sess.clone();
+        let cancel = self.conn(sess.conn_id).map(|c| {
+            c.cancel.store(false, Ordering::Relaxed);
+            c.cancel.clone()
+        });
         let joined = tokio::task::spawn_blocking(move || {
+            novadb_sql::set_cancel_flag(cancel);
             let (r, status) = match eng.lock() {
                 Ok(mut e) => {
                     let r = e.run_in(&st, &mut s);
@@ -61,6 +77,7 @@ impl Server {
                 }
                 Err(_) => (Err(SqlError::internal("engine lock poisoned")), 2),
             };
+            novadb_sql::set_cancel_flag(None);
             (r, status, s)
         })
         .await;
@@ -103,6 +120,78 @@ impl Server {
         })
         .await
         .unwrap_or(false)
+    }
+
+    fn conn(&self, id: u32) -> Option<Arc<ConnInfo>> {
+        self.conns.lock().ok().and_then(|m| m.get(&id).cloned())
+    }
+
+    fn register(&self, id: u32, c: Arc<ConnInfo>) {
+        if let Ok(mut m) = self.conns.lock() {
+            m.insert(id, c);
+        }
+    }
+
+    fn unregister(&self, id: u32) {
+        if let Ok(mut m) = self.conns.lock() {
+            m.remove(&id);
+        }
+    }
+
+    /// KILL: users may kill their own connections, root any.
+    fn kill(&self, by: &str, id: u64, query_only: bool) -> Result<(), SqlError> {
+        let target = u32::try_from(id).ok().and_then(|i| self.conn(i));
+        let Some(t) = target else {
+            let mut e = SqlError::internal(format!("Unknown thread id: {id}"));
+            e.code = 1094;
+            return Err(e);
+        };
+        if !by.eq_ignore_ascii_case("root") && !t.user.eq_ignore_ascii_case(by) {
+            let mut e = SqlError::internal(format!("You are not owner of thread {id}"));
+            e.code = 1095;
+            return Err(e);
+        }
+        t.cancel.store(true, Ordering::Relaxed);
+        if !query_only {
+            t.closing.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn processlist(&self, by: &str) -> QueryResult {
+        let mut rows = Vec::new();
+        if let Ok(m) = self.conns.lock() {
+            let mut ids: Vec<&u32> = m.keys().collect();
+            ids.sort();
+            for id in ids {
+                let c = &m[id];
+                if !by.eq_ignore_ascii_case("root") && !c.user.eq_ignore_ascii_case(by) {
+                    continue;
+                }
+                let info = c.info.lock().ok().and_then(|i| i.clone());
+                rows.push(vec![
+                    novadb_sql::Value::Int(i64::from(*id)),
+                    novadb_sql::Value::Str(c.user.clone()),
+                    novadb_sql::Value::Str(c.host.clone()),
+                    novadb_sql::Value::Str("novadb".into()),
+                    novadb_sql::Value::Str(if info.is_some() { "Query" } else { "Sleep" }.into()),
+                    novadb_sql::Value::Int(c.since.elapsed().as_secs() as i64),
+                    info.map_or(novadb_sql::Value::Null, novadb_sql::Value::Str),
+                ]);
+            }
+        }
+        let names = ["Id", "User", "Host", "db", "Command", "Time", "Info"];
+        QueryResult {
+            columns: names
+                .iter()
+                .map(|n| novadb_sql::ColumnMeta {
+                    name: (*n).into(),
+                    ty: None,
+                })
+                .collect(),
+            rows,
+            ..Default::default()
+        }
     }
 
     fn active(&self) -> usize {
@@ -323,6 +412,7 @@ fn run(cfg: Config) -> Result<(), String> {
     let tls = tls_config(&cfg)?;
     let server = Arc::new(Server {
         engine: Arc::new(Mutex::new(engine)),
+        conns: Mutex::new(HashMap::new()),
         tls: TlsAcceptor::from(Arc::new(tls)),
         limiter: auth::RateLimiter::new(),
         hash_sem: tokio::sync::Semaphore::new(2),

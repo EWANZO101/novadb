@@ -73,6 +73,8 @@ pub struct Session {
     pub user: String,
     pub conn_id: u32,
     pub last_insert_id: u64,
+    /// SET max_execution_time (ms, SELECT only; 0 = unlimited).
+    pub max_execution_ms: u64,
 }
 
 pub const USERS_TREE: &str = "sql:users";
@@ -285,6 +287,27 @@ impl Engine {
     pub fn run_in(&mut self, s: &Stmt, sess: &mut Session) -> Result<QueryResult> {
         CURRENT.with(|c| *c.borrow_mut() = sess.clone());
         let conn = sess.conn_id;
+        if let Stmt::Set(assignments) = s {
+            for (n, e) in assignments {
+                if n == "max_execution_time" {
+                    let env = Env {
+                        t: None,
+                        row: &[],
+                        now: (self.clock)(),
+                    };
+                    let v = eval(e, &env)?
+                        .to_num()
+                        .map_or(0, |(x, sc)| crate::value::rescale(x, sc, 0).unwrap_or(0));
+                    sess.max_execution_ms = u64::try_from(v).unwrap_or(0);
+                }
+            }
+        }
+        set_deadline(match s {
+            Stmt::Select(_) if sess.max_execution_ms > 0 => Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(sess.max_execution_ms),
+            ),
+            _ => None,
+        });
         let r = match s {
             Stmt::Txn(TxnKind::Begin) => {
                 self.commit_txn(conn)?;
@@ -536,7 +559,31 @@ fn run_stmt(mv: &mut Mv<'_, '_>, s: &Stmt, now: i64) -> Result<QueryResult> {
             unique,
         } => create_index(mv, name, table, cols, *unique),
         Stmt::DropIndex { name, table } => drop_index(mv, name, table),
-        Stmt::Insert { table, cols, rows } => insert(mv, table, cols.as_deref(), rows, now),
+        Stmt::Insert {
+            table,
+            cols,
+            rows,
+            select: source,
+        } => {
+            let mut rows = rows.clone();
+            for r in &mut rows {
+                for e in r {
+                    crate::query::materialize_expr(mv, e, now)?;
+                }
+            }
+            if let Some(sel) = source {
+                let q = select(mv, sel, now)?;
+                rows = q
+                    .rows
+                    .into_iter()
+                    .map(|r| r.into_iter().map(Expr::Lit).collect())
+                    .collect();
+            }
+            insert(mv, table, cols.as_deref(), &rows, now)
+        }
+        Stmt::Kill { .. } | Stmt::ShowProcesslist => Err(SqlError::unsupported(
+            "KILL / SHOW PROCESSLIST outside the server",
+        )),
         Stmt::Select(sel) => select(mv, sel, now),
         Stmt::Update {
             table,
@@ -544,13 +591,40 @@ fn run_stmt(mv: &mut Mv<'_, '_>, s: &Stmt, now: i64) -> Result<QueryResult> {
             filter,
             order,
             limit,
-        } => update(mv, table, sets, filter.as_ref(), order, *limit, now),
+        } => {
+            let mut sets = sets.clone();
+            let mut filter = filter.clone();
+            let mut order = order.clone();
+            for (_, e) in &mut sets {
+                crate::query::materialize_expr(mv, e, now)?;
+                crate::query::strip_qualifiers(e, table, None)?;
+            }
+            if let Some(f) = &mut filter {
+                crate::query::materialize_expr(mv, f, now)?;
+                crate::query::strip_qualifiers(f, table, None)?;
+            }
+            for o in &mut order {
+                crate::query::strip_qualifiers(&mut o.expr, table, None)?;
+            }
+            update(mv, table, &sets, filter.as_ref(), &order, *limit, now)
+        }
         Stmt::Delete {
             table,
             filter,
             order,
             limit,
-        } => delete(mv, table, filter.as_ref(), order, *limit, now),
+        } => {
+            let mut filter = filter.clone();
+            let mut order = order.clone();
+            if let Some(f) = &mut filter {
+                crate::query::materialize_expr(mv, f, now)?;
+                crate::query::strip_qualifiers(f, table, None)?;
+            }
+            for o in &mut order {
+                crate::query::strip_qualifiers(&mut o.expr, table, None)?;
+            }
+            delete(mv, table, filter.as_ref(), &order, *limit, now)
+        }
         Stmt::ShowTables => show_tables(mv.tx),
         Stmt::Describe(t) => describe(mv.tx, t),
         Stmt::ShowCreateTable(t) => show_create(mv.tx, t),
@@ -608,7 +682,7 @@ fn find_table(tx: &mut Tx<'_>, name: &str) -> Result<Option<Table>> {
     }
 }
 
-fn load_table(tx: &mut Tx<'_>, name: &str) -> Result<Table> {
+pub(crate) fn load_table(tx: &mut Tx<'_>, name: &str) -> Result<Table> {
     find_table(tx, name)?.ok_or_else(|| SqlError::no_table(name))
 }
 
@@ -648,13 +722,13 @@ fn rowid_key(id: u64) -> Vec<u8> {
     k
 }
 
-struct Trees {
+pub(crate) struct Trees {
     rows: Tree,
     ovf: Tree,
     idx: Vec<Tree>,
 }
 
-fn open_trees(tx: &mut Tx<'_>, t: &Table) -> Result<Trees> {
+pub(crate) fn open_trees(tx: &mut Tx<'_>, t: &Table) -> Result<Trees> {
     let rows = tx.open_tree(&t.rows_tree())?;
     let ovf = tx.open_tree(&t.overflow_tree())?;
     let mut idx = Vec::with_capacity(t.indexes.len());
@@ -848,10 +922,55 @@ fn index_delete(
 
 // ----- expressions ---------------------------------------------------------------------------
 
-struct Env<'a> {
-    t: Option<&'a Table>,
-    row: &'a [Value],
-    now: i64,
+pub(crate) struct Env<'a> {
+    pub(crate) t: Option<&'a Table>,
+    pub(crate) row: &'a [Value],
+    pub(crate) now: i64,
+}
+
+pub(crate) fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+thread_local! {
+    /// Cancellation flag (set by the server for KILL QUERY) and statement deadline
+    /// (max_execution_time) for the statement running on this thread.
+    static INTERRUPT: std::cell::RefCell<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, Option<std::time::Instant>)> =
+        const { std::cell::RefCell::new((None, None)) };
+}
+
+/// Install the cancellation flag checked by long-running statements on this thread.
+pub fn set_cancel_flag(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+    INTERRUPT.with(|i| i.borrow_mut().0 = flag);
+}
+
+fn set_deadline(d: Option<std::time::Instant>) {
+    INTERRUPT.with(|i| i.borrow_mut().1 = d);
+}
+
+/// Error out if the running statement was killed or ran past its deadline.
+pub(crate) fn check_interrupt() -> Result<()> {
+    INTERRUPT.with(|i| {
+        let i = i.borrow();
+        if let Some(f) = &i.0
+            && f.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut e = SqlError::internal("Query execution was interrupted");
+            e.code = 1317;
+            e.state = "70100";
+            return Err(e);
+        }
+        if let Some(d) = i.1
+            && std::time::Instant::now() >= d
+        {
+            let mut e = SqlError::internal(
+                "Query execution was interrupted, maximum statement execution time exceeded",
+            );
+            e.code = 3024;
+            return Err(e);
+        }
+        Ok(())
+    })
 }
 
 fn check_cols(e: &Expr, t: Option<&Table>) -> Result<()> {
@@ -869,10 +988,14 @@ fn tv(b: Option<bool>) -> Value {
     b.map_or(Value::Null, Value::bool)
 }
 
-fn eval(e: &Expr, env: &Env<'_>) -> Result<Value> {
+pub(crate) fn eval(e: &Expr, env: &Env<'_>) -> Result<Value> {
     Ok(match e {
         Expr::Lit(v) => v.clone(),
         Expr::Param(_) => return Err(SqlError::param_count()),
+        // Subqueries are replaced by their results before evaluation (query::materialize_*).
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+            return Err(SqlError::internal("subquery was not materialized"));
+        }
         Expr::Col(c) => {
             let i = env
                 .t
@@ -1225,6 +1348,12 @@ fn func(name: &str, args: &[Expr], env: &Env<'_>) -> Result<Value> {
             need(n == 0)?;
             Value::Str("novadb".into())
         }
+        // Aggregates are evaluated by the grouping code; anywhere else they are misplaced.
+        _ if crate::query::is_aggregate(name) => {
+            let mut e = SqlError::internal("Invalid use of group function");
+            e.code = 1111;
+            return Err(e);
+        }
         _ => return Err(SqlError::wrong_func(name)),
     })
 }
@@ -1234,7 +1363,7 @@ fn trunc_fsp(now: i64, fsp: u8) -> i64 {
     now - now.rem_euclid(10i64.pow(u32::from(6 - fsp.min(6))))
 }
 
-fn matches(filter: Option<&Expr>, env: &Env<'_>) -> Result<bool> {
+pub(crate) fn matches(filter: Option<&Expr>, env: &Env<'_>) -> Result<bool> {
     match filter {
         None => Ok(true),
         Some(f) => Ok(eval(f, env)?.truth() == Some(true)),
@@ -1244,7 +1373,7 @@ fn matches(filter: Option<&Expr>, env: &Env<'_>) -> Result<bool> {
 // ----- planner -------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
-enum Access {
+pub(crate) enum Access {
     Full,
     /// Primary-key range (point when lo == hi on the full key).
     Pk {
@@ -1426,7 +1555,7 @@ fn first_col_bounds(t: &Table, col: usize, preds: &[(usize, Op, Value)]) -> Opti
     Some((lo, hi, false))
 }
 
-fn plan(t: &Table, filter: Option<&Expr>, now: i64) -> Access {
+pub(crate) fn plan(t: &Table, filter: Option<&Expr>, now: i64) -> Access {
     let Some(f) = filter else { return Access::Full };
     let preds = simple_preds(t, f, now);
     if preds.is_empty() {
@@ -1517,7 +1646,7 @@ fn plan(t: &Table, filter: Option<&Expr>, now: i64) -> Access {
 }
 
 /// Visit matching rows in access order; `visit` returns false to stop early.
-fn scan(
+pub(crate) fn scan(
     mv: &mut Mv<'_, '_>,
     t: &Table,
     tr: &Trees,
@@ -1544,6 +1673,7 @@ fn scan(
                 _ => (Bound::Unbounded, Bound::Unbounded),
             };
             loop {
+                check_interrupt()?;
                 let b = mv.scan(&tr.rows, &lo, &hi, SCAN_BATCH)?;
                 let Some((last, _)) = b.last() else { break };
                 lo = Bound::Excluded(last.clone());
@@ -1562,6 +1692,7 @@ fn scan(
                 .ok_or_else(|| SqlError::internal("index handle"))?;
             let mut lo = lo.clone();
             loop {
+                check_interrupt()?;
                 let b = mv.scan(tree, &lo, hi, SCAN_BATCH)?;
                 let Some((last, _)) = b.last() else { break };
                 lo = Bound::Excluded(last.clone());
@@ -2198,7 +2329,27 @@ enum Item<'a> {
     Expr(&'a Expr),
 }
 
-fn select(mv: &mut Mv<'_, '_>, s: &Select, now: i64) -> Result<QueryResult> {
+pub(crate) fn select(mv: &mut Mv<'_, '_>, s: &Select, now: i64) -> Result<QueryResult> {
+    let mut owned = s.clone();
+    crate::query::materialize_select(mv, &mut owned, now)?;
+    if crate::query::needs_general(&owned) {
+        return crate::query::select_general(mv, &owned, now);
+    }
+    if let Some(name) = &owned.from {
+        let alias = owned.alias.clone();
+        for it in &mut owned.items {
+            if let SelectItem::Expr { expr, .. } = it {
+                crate::query::strip_qualifiers(expr, name, alias.as_deref())?;
+            }
+        }
+        if let Some(f) = &mut owned.filter {
+            crate::query::strip_qualifiers(f, name, alias.as_deref())?;
+        }
+        for o in &mut owned.order {
+            crate::query::strip_qualifiers(&mut o.expr, name, alias.as_deref())?;
+        }
+    }
+    let s = &owned;
     let t = match &s.from {
         Some(name) => Some(load_table(mv.tx, name)?),
         None => None,
@@ -2208,6 +2359,9 @@ fn select(mv: &mut Mv<'_, '_>, s: &Select, now: i64) -> Result<QueryResult> {
     let mut columns = Vec::new();
     for it in &s.items {
         match it {
+            SelectItem::TableStar(_) => {
+                return Err(SqlError::internal("t.* is handled by the join path"));
+            }
             SelectItem::Star => {
                 let Some(t) = &t else {
                     return Err(SqlError::syntax(0, "*", "SELECT * needs a FROM clause"));

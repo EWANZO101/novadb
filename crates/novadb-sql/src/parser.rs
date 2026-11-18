@@ -12,6 +12,17 @@ pub const MAX_IDENT: usize = 64;
 
 /// Words that cannot be used as bare identifiers.
 const RESERVED: &[&str] = &[
+    "join",
+    "inner",
+    "left",
+    "right",
+    "cross",
+    "outer",
+    "using",
+    "natural",
+    "group",
+    "having",
+    "union",
     "select",
     "from",
     "where",
@@ -309,6 +320,16 @@ impl<'a> Parser<'a> {
     }
 
     fn statement(&mut self) -> Result<Stmt> {
+        if self.eat_kw("kill") {
+            let query_only = if self.eat_kw("query") {
+                true
+            } else {
+                let _ = self.eat_kw("connection");
+                false
+            };
+            let id = self.uint()?;
+            return Ok(Stmt::Kill { id, query_only });
+        }
         if self.eat_kw("set") {
             return self.set_stmt();
         }
@@ -387,6 +408,9 @@ impl<'a> Parser<'a> {
             let _ = self.eat_kw("session") || self.eat_kw("global") || self.eat_kw("full");
             if self.eat_kw("databases") || self.eat_kw("schemas") {
                 return Ok(Stmt::ShowDatabases);
+            }
+            if self.eat_kw("processlist") {
+                return Ok(Stmt::ShowProcesslist);
             }
             if self.eat_kw("warnings") || self.eat_kw("errors") {
                 return Ok(Stmt::ShowWarnings);
@@ -715,6 +739,15 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+        if self.eat_kw("select") {
+            let sel = self.select()?;
+            return Ok(Stmt::Insert {
+                table,
+                cols,
+                rows: Vec::new(),
+                select: Some(Box::new(sel)),
+            });
+        }
         if !self.eat_kw("values") {
             self.kw("value")?;
         }
@@ -734,7 +767,12 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(Stmt::Insert { table, cols, rows })
+        Ok(Stmt::Insert {
+            table,
+            cols,
+            rows,
+            select: None,
+        })
     }
 
     fn order_by(&mut self) -> Result<Vec<OrderBy>> {
@@ -767,6 +805,13 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat_sym("*") {
                 items.push(SelectItem::Star);
+            } else if matches!(self.peek(), Tok::Ident(_) | Tok::QIdent(_))
+                && matches!(self.peek_at(1), Tok::Sym("."))
+                && matches!(self.peek_at(2), Tok::Sym("*"))
+            {
+                let t = self.ident()?;
+                self.i += 2;
+                items.push(SelectItem::TableStar(t));
             } else {
                 let start = self.pos();
                 let expr = self.expr()?;
@@ -796,27 +841,125 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let from = if self.eat_kw("from") {
-            Some(self.ident()?)
+        let (mut from, mut alias, mut joins) = (None, None, Vec::new());
+        if self.eat_kw("from") {
+            from = Some(self.ident()?);
+            alias = self.table_alias()?;
+            loop {
+                let kind = if self.eat_sym(",") {
+                    JoinKind::Cross
+                } else if self.eat_kw("join") {
+                    JoinKind::Inner
+                } else if self.is_kw("inner") || self.is_kw("cross") {
+                    let k = if self.eat_kw("inner") {
+                        JoinKind::Inner
+                    } else {
+                        self.i += 1;
+                        JoinKind::Cross
+                    };
+                    self.kw("join")?;
+                    k
+                } else if self.is_kw("left") || self.is_kw("right") {
+                    let k = if self.eat_kw("left") {
+                        JoinKind::Left
+                    } else {
+                        self.i += 1;
+                        JoinKind::Right
+                    };
+                    let _ = self.eat_kw("outer");
+                    self.kw("join")?;
+                    k
+                } else if self.is_kw("natural") {
+                    return Err(SqlError::unsupported("NATURAL JOIN"));
+                } else {
+                    break;
+                };
+                let table = self.ident()?;
+                let jalias = self.table_alias()?;
+                let (mut on, mut using) = (None, Vec::new());
+                if kind != JoinKind::Cross || self.is_kw("on") || self.is_kw("using") {
+                    if self.eat_kw("on") {
+                        on = Some(self.expr()?);
+                    } else if self.eat_kw("using") {
+                        using = self.ident_list()?;
+                    } else if kind != JoinKind::Cross && kind != JoinKind::Inner {
+                        return Err(self.err("expected ON or USING"));
+                    }
+                }
+                joins.push(Join {
+                    kind,
+                    table,
+                    alias: jalias,
+                    on,
+                    using,
+                });
+                if joins.len() > 60 {
+                    return Err(SqlError::unsupported("more than 61 tables in a join"));
+                }
+            }
+        }
+        let filter = if self.eat_kw("where") {
+            Some(self.expr()?)
         } else {
             None
         };
-        let filter = if self.eat_kw("where") {
+        let mut group_by = Vec::new();
+        if self.is_kw("group") && self.is_kw_at(1, "by") {
+            self.i += 2;
+            loop {
+                group_by.push(self.expr()?);
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        let having = if self.eat_kw("having") {
             Some(self.expr()?)
         } else {
             None
         };
         let order = self.order_by()?;
         let (limit, offset) = self.limit_offset(true)?;
+        if self.is_kw("union") {
+            return Err(SqlError::unsupported("UNION"));
+        }
+        if self.is_kw("for") || self.is_kw("lock") {
+            return Err(SqlError::unsupported(
+                "SELECT ... FOR UPDATE / LOCK IN SHARE MODE",
+            ));
+        }
         Ok(Select {
             distinct,
             items,
             from,
+            alias,
+            joins,
             filter,
+            group_by,
+            having,
             order,
             limit,
             offset,
         })
+    }
+
+    /// `[AS] alias` after a table name.
+    fn table_alias(&mut self) -> Result<Option<String>> {
+        if self.eat_kw("as") {
+            return self.ident().map(Some);
+        }
+        match self.peek() {
+            Tok::QIdent(_) => self.ident().map(Some),
+            Tok::Ident(s)
+                if !RESERVED.iter().any(|r| s.eq_ignore_ascii_case(r))
+                    && !["on", "where", "limit", "order", "set", "for", "lock"]
+                        .iter()
+                        .any(|r| s.eq_ignore_ascii_case(r)) =>
+            {
+                self.ident().map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn limit_offset(&mut self, allow_offset: bool) -> Result<(Option<u64>, u64)> {
@@ -1020,6 +1163,16 @@ impl<'a> Parser<'a> {
             }
             if self.eat_kw("in") {
                 self.sym("(")?;
+                if self.eat_kw("select") {
+                    let sub = self.select()?;
+                    self.sym(")")?;
+                    l = Expr::InSubquery {
+                        e: Box::new(l),
+                        sub: Box::new(sub),
+                        neg,
+                    };
+                    continue;
+                }
                 let mut list = vec![self.expr()?];
                 while self.eat_sym(",") {
                     list.push(self.expr()?);
@@ -1170,9 +1323,26 @@ impl<'a> Parser<'a> {
             }
             Tok::Sym("(") => {
                 self.i += 1;
+                if self.eat_kw("select") {
+                    let sub = self.select()?;
+                    self.sym(")")?;
+                    return Ok(Expr::Subquery(Box::new(sub)));
+                }
                 let e = self.expr()?;
                 self.sym(")")?;
                 Ok(e)
+            }
+            Tok::Ident(s)
+                if s.eq_ignore_ascii_case("exists") && matches!(self.peek_at(1), Tok::Sym("(")) =>
+            {
+                self.i += 2;
+                self.kw("select")?;
+                let sub = self.select()?;
+                self.sym(")")?;
+                Ok(Expr::Exists {
+                    sub: Box::new(sub),
+                    neg: false,
+                })
             }
             Tok::Ident(s) if s.eq_ignore_ascii_case("null") => {
                 self.i += 1;
@@ -1204,24 +1374,43 @@ impl<'a> Parser<'a> {
                         && (s.eq_ignore_ascii_case("if") || s.eq_ignore_ascii_case("mod"))) =>
             {
                 self.i += 2;
+                let mut name = s.to_ascii_lowercase();
                 let mut args = Vec::new();
+                if name == "count" && matches!(self.peek(), Tok::Sym("*")) {
+                    // COUNT(*) counts rows: same as COUNT(1).
+                    self.i += 1;
+                    self.sym(")")?;
+                    return Ok(Expr::Func {
+                        name,
+                        args: vec![Expr::Lit(Value::Int(1))],
+                    });
+                }
+                if crate::query::is_aggregate(&name) && self.eat_kw("distinct") {
+                    name = format!("{name}_distinct");
+                }
                 if !self.eat_sym(")") {
                     args.push(self.expr()?);
                     while self.eat_sym(",") {
                         args.push(self.expr()?);
                     }
+                    if name.starts_with("group_concat") && self.eat_kw("separator") {
+                        match self.bump() {
+                            Tok::Str(sep) => args.push(Expr::Lit(Value::Str(sep))),
+                            _ => return Err(self.err("expected a separator string")),
+                        }
+                        if !name.ends_with("_sep") {
+                            name.push_str("_sep");
+                        }
+                    }
                     self.sym(")")?;
                 }
-                Ok(Expr::Func {
-                    name: s.to_ascii_lowercase(),
-                    args,
-                })
+                Ok(Expr::Func { name, args })
             }
             Tok::Ident(_) | Tok::QIdent(_) => {
                 let mut name = self.ident()?;
-                // table.column: the table part is accepted and ignored (single-table queries).
+                // table.column is kept as "table.column" and resolved by the executor.
                 if self.eat_sym(".") {
-                    name = self.ident()?;
+                    name = format!("{name}.{}", self.ident()?);
                 }
                 Ok(Expr::Col(name))
             }

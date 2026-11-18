@@ -34,7 +34,7 @@ impl Db {
         let mut s = Session {
             user: "t".into(),
             conn_id: conn,
-            last_insert_id: 0,
+            ..Default::default()
         };
         let mut out = None;
         for st in novadb_sql::parse(sql)? {

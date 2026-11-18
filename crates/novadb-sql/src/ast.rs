@@ -23,6 +23,8 @@ pub enum Stmt {
         table: String,
         cols: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
+        /// INSERT … SELECT
+        select: Option<Box<Select>>,
     },
     Select(Select),
     Update {
@@ -39,6 +41,13 @@ pub enum Stmt {
         limit: Option<u64>,
     },
     ShowTables,
+    /// SHOW [FULL] PROCESSLIST — handled by the server.
+    ShowProcesslist,
+    /// KILL [CONNECTION | QUERY] id — handled by the server.
+    Kill {
+        id: u64,
+        query_only: bool,
+    },
     ShowDatabases,
     /// SHOW [SESSION|GLOBAL] VARIABLES / STATUS [LIKE 'pattern']
     ShowVariables {
@@ -113,11 +122,30 @@ pub struct CreateTable {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Star,
+    /// `alias.*`
+    TableStar(String),
     Expr {
         expr: Expr,
         alias: Option<String>,
         text: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Cross,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub kind: JoinKind,
+    pub table: String,
+    pub alias: Option<String>,
+    pub on: Option<Expr>,
+    pub using: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,7 +159,12 @@ pub struct Select {
     pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Option<String>,
+    /// Alias of the first FROM table.
+    pub alias: Option<String>,
+    pub joins: Vec<Join>,
     pub filter: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
     pub order: Vec<OrderBy>,
     pub limit: Option<u64>,
     pub offset: u64,
@@ -202,6 +235,17 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// Scalar subquery `(SELECT …)`.
+    Subquery(Box<Select>),
+    InSubquery {
+        e: Box<Expr>,
+        sub: Box<Select>,
+        neg: bool,
+    },
+    Exists {
+        sub: Box<Select>,
+        neg: bool,
+    },
 }
 
 impl Expr {
@@ -235,6 +279,9 @@ impl Expr {
                     a.columns(out);
                 }
             }
+            // Subqueries have their own scope (only uncorrelated ones are supported).
+            Expr::Subquery(_) | Expr::Exists { .. } => {}
+            Expr::InSubquery { e, .. } => e.columns(out),
         }
     }
 }
@@ -269,6 +316,36 @@ pub fn walk_expr_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
                 walk_expr_mut(a, f);
             }
         }
+        Expr::Subquery(sub) | Expr::Exists { sub, .. } => walk_select_mut(sub, f),
+        Expr::InSubquery { e, sub, .. } => {
+            walk_expr_mut(e, f);
+            walk_select_mut(sub, f);
+        }
+    }
+}
+
+pub fn walk_select_mut(sel: &mut Select, f: &mut dyn FnMut(&mut Expr)) {
+    for it in &mut sel.items {
+        if let SelectItem::Expr { expr, .. } = it {
+            walk_expr_mut(expr, f);
+        }
+    }
+    for j in &mut sel.joins {
+        if let Some(on) = &mut j.on {
+            walk_expr_mut(on, f);
+        }
+    }
+    if let Some(w) = &mut sel.filter {
+        walk_expr_mut(w, f);
+    }
+    for g in &mut sel.group_by {
+        walk_expr_mut(g, f);
+    }
+    if let Some(h) = &mut sel.having {
+        walk_expr_mut(h, f);
+    }
+    for o in &mut sel.order {
+        walk_expr_mut(&mut o.expr, f);
     }
 }
 
@@ -280,24 +357,17 @@ pub fn walk_stmt_mut(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
         }
     };
     match s {
-        Stmt::Insert { rows, .. } => {
+        Stmt::Insert { rows, select, .. } => {
             for r in rows {
                 for e in r {
                     walk_expr_mut(e, f);
                 }
             }
-        }
-        Stmt::Select(sel) => {
-            for it in &mut sel.items {
-                if let SelectItem::Expr { expr, .. } = it {
-                    walk_expr_mut(expr, f);
-                }
+            if let Some(sel) = select {
+                walk_select_mut(sel, f);
             }
-            if let Some(w) = &mut sel.filter {
-                walk_expr_mut(w, f);
-            }
-            order(&mut sel.order, f);
         }
+        Stmt::Select(sel) => walk_select_mut(sel, f),
         Stmt::Update {
             sets,
             filter,

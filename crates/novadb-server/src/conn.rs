@@ -94,18 +94,28 @@ pub async fn handle(server: Arc<Server>, tcp: TcpStream, peer: SocketAddr, conn_
             return;
         }
     };
+    let info = Arc::new(crate::ConnInfo {
+        user: user.clone(),
+        host: format!("{}:{}", peer.ip(), peer.port()),
+        since: std::time::Instant::now(),
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        info: std::sync::Mutex::new(None),
+    });
+    server.register(conn_id, info);
     let r = command_loop(
         &server,
         &mut tls,
         Session {
             user,
             conn_id,
-            last_insert_id: 0,
+            ..Default::default()
         },
         caps,
     )
     .await;
     // Whatever the client left open is rolled back (like MySQL on disconnect).
+    server.unregister(conn_id);
     server.end_session(conn_id).await;
     if let Err(e) = r
         && e.kind() != io::ErrorKind::UnexpectedEof
@@ -233,7 +243,14 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
     let mut prepared: HashMap<u32, Prepared> = HashMap::new();
     let mut next_stmt = 1u32;
     let mut status = pk::SERVER_STATUS_AUTOCOMMIT;
+    let me = server.conn(sess.conn_id);
     loop {
+        if me
+            .as_ref()
+            .is_some_and(|c| c.closing.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Ok(());
+        }
         let (_, p) =
             match tokio::time::timeout(IDLE_TIMEOUT, read_packet(s, server.max_packet)).await {
                 Ok(r) => r?,
@@ -296,7 +313,28 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                         let n = stmts.len();
                         for (i, st) in stmts.into_iter().enumerate() {
                             let more = i + 1 < n;
-                            let (res, st_bits) = server.run(st, &mut sess).await;
+                            if let Some(c) = &me
+                                && let Ok(mut i) = c.info.lock()
+                            {
+                                *i = Some(format!("{st:?}").chars().take(100).collect());
+                            }
+                            let (res, st_bits) = match &st {
+                                Stmt::Kill { id, query_only } => (
+                                    server
+                                        .kill(&sess.user, *id, *query_only)
+                                        .map(|_| QueryResult::default()),
+                                    status,
+                                ),
+                                Stmt::ShowProcesslist => {
+                                    (Ok(server.processlist(&sess.user)), status)
+                                }
+                                _ => server.run(st, &mut sess).await,
+                            };
+                            if let Some(c) = &me
+                                && let Ok(mut i) = c.info.lock()
+                            {
+                                *i = None;
+                            }
                             status = st_bits;
                             match res {
                                 Ok(r) => {
