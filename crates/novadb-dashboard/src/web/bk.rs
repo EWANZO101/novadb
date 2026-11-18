@@ -154,8 +154,8 @@ async fn render(app: &App, c: &Ctx, flash: Flash<'_>) -> Res {
     let body = format!(
         r#"{head}
 <div class="kpis">{k1}{k2}{k3}{k4}</div>
-<div class="card"><div class="card-h">{iar}<h2>Workspace backups</h2><span class="r hint">newest first</span></div>
-<div class="tbl"><table><thead><tr><th>File</th><th>Type</th><th>Created</th><th>Contents</th><th>Size</th><th class="r">Actions</th></tr></thead><tbody>{rows}</tbody></table></div>
+<div class="card menus"><div class="card-h">{iar}<h2>Workspace backups</h2><span class="r hint">newest first</span></div>
+<div class="tbl stack"><table><thead><tr><th>File</th><th>Type</th><th>Created</th><th>Contents</th><th>Size</th><th class="r">Actions</th></tr></thead><tbody>{rows}</tbody></table></div>
 <div class="card-f">Logical SQL dumps taken from one consistent snapshot. Each ends with a SHA-256 line that is checked before any restore. The newest {keep} automatic backups are kept; manual ones stay until you delete them.</div></div>
 <div class="card"><div class="card-h">{ilock}<h2>What is not in here</h2></div><div class="card-b"><p class="sub">The dashboard's own system database (accounts, password hashes, 2FA secrets, audit log) is deliberately not downloadable. Back up the <code>novadb-dash-data</code> Docker volume on the server for that.</p></div></div>"#,
         head = html::header(

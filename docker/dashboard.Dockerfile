@@ -10,5 +10,5 @@ COPY novadb-dashboard /usr/local/bin/novadb-dashboard
 USER novadb
 ENV NOVADB_DASH_DATA=/data NOVADB_DASH_LISTEN=127.0.0.1:9620
 VOLUME /data
-HEALTHCHECK --interval=60s --timeout=5s CMD ["/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/9620 || exit 1"]
+HEALTHCHECK --interval=60s --timeout=5s CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9620 || exit 1"]
 ENTRYPOINT ["/usr/local/bin/novadb-dashboard"]

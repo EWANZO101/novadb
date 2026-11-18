@@ -1695,7 +1695,7 @@ async fn users_render(app: &App, c: &Ctx, flash: Flash<'_>, reveal: Option<(&str
     };
     let body = format!(
         r#"{head}{reveal_html}
-<div class="card"><div class="card-h">{iusers}<h2>Members</h2><span class="r hint">{n} accounts</span></div><div class="tbl"><table><thead><tr><th>User</th><th>Role</th><th>Status</th><th>Last sign-in</th><th class="r">Actions</th></tr></thead><tbody>{rows}</tbody></table></div></div>
+<div class="card menus"><div class="card-h">{iusers}<h2>Members</h2><span class="r hint">{n} accounts</span></div><div class="tbl"><table><thead><tr><th>User</th><th>Role</th><th>Status</th><th>Last sign-in</th><th class="r">Actions</th></tr></thead><tbody>{rows}</tbody></table></div></div>
 <div class="card"><div class="card-h">{iadd}<h2>Invite a user</h2></div><div class="card-b"><form method="post" action="/users/create" class="addform">{}
 <div><label for="nu">Username</label><input id="nu" type="text" name="username" placeholder="a-z 0-9 . _ -" required maxlength="32"></div>
 <div><label for="nr">Role</label><select id="nr" name="role"><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Admin</option></select></div>
