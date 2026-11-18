@@ -72,11 +72,13 @@ type KeyWrites = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 pub struct WriteSet {
     trees: BTreeMap<u64, (Tree, KeyWrites)>,
     bytes: usize,
+    /// Logical changes for the binary log (undone together with the writes).
+    pub(crate) log: Vec<crate::binlog::LogOp>,
 }
 
 impl WriteSet {
     pub fn is_empty(&self) -> bool {
-        self.trees.values().all(|(_, m)| m.is_empty())
+        self.trees.values().all(|(_, m)| m.is_empty()) && self.log.is_empty()
     }
     pub fn len(&self) -> usize {
         self.trees.values().map(|(_, m)| m.len()).sum()

@@ -13,6 +13,7 @@
 
 mod auth;
 mod conn;
+mod ops;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -47,6 +48,9 @@ pub struct ConnInfo {
 
 pub struct Server {
     engine: Arc<Mutex<Engine>>,
+    data_dir: PathBuf,
+    backup_key: [u8; 32],
+    metrics: ops::Metrics,
     conns: Mutex<HashMap<u32, Arc<ConnInfo>>>,
     tls: TlsAcceptor,
     limiter: auth::RateLimiter,
@@ -68,6 +72,7 @@ impl Server {
             c.cancel.store(false, Ordering::Relaxed);
             c.cancel.clone()
         });
+        let started = Instant::now();
         let joined = tokio::task::spawn_blocking(move || {
             novadb_sql::set_cancel_flag(cancel);
             let (r, status) = match eng.lock() {
@@ -81,6 +86,18 @@ impl Server {
             (r, status, s)
         })
         .await;
+        let m = &self.metrics;
+        ops::Metrics::inc(&m.queries);
+        m.query_micros
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Ok((Err(e), _, _)) = &joined {
+            ops::Metrics::inc(&m.query_errors);
+            match e.code {
+                1213 => ops::Metrics::inc(&m.conflicts),
+                1317 | 3024 => ops::Metrics::inc(&m.interrupted),
+                _ => {}
+            }
+        }
         match joined {
             Ok((r, status, s)) => {
                 *sess = s;
@@ -204,25 +221,62 @@ struct Config {
     listen: SocketAddr,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    backup_key: Option<PathBuf>,
+    metrics: Option<SocketAddr>,
+    metrics_token: Option<String>,
+    no_binlog: bool,
 }
 
-const USAGE: &str = "usage: novadb-server --data-dir DIR [--listen 127.0.0.1:3307] [--tls-cert FILE --tls-key FILE] | --version";
+const USAGE: &str = "usage:
+  novadb-server --data-dir DIR [--listen 127.0.0.1:3307] [--tls-cert FILE --tls-key FILE]
+                [--backup-key FILE] [--metrics 127.0.0.1:9104] [--metrics-token-file FILE] [--no-binlog]
+  novadb-server --restore BACKUP.nbk --data-dir NEW_DIR --backup-key FILE [--binlog-dir DIR] [--until 'YYYY-MM-DD HH:MM:SS']
+  novadb-server --gen-backup-key FILE
+  novadb-server --version";
 
 fn parse_args() -> Result<Option<Config>, String> {
     let mut args = std::env::args().skip(1);
     let (mut dir, mut listen, mut cert, mut key) = (None, None, None, None);
+    let (mut bkey, mut metrics, mut mtoken, mut no_binlog) = (None, None, None, false);
+    let (mut restore, mut binlog_dir, mut until) = (None, None, None);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--version" => {
                 println!("novadb-server {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
+            "--gen-backup-key" => {
+                let p = args.next().ok_or(USAGE)?;
+                ops::write_key_file(Path::new(&p))?;
+                println!("wrote a new 256-bit key to {p} (0600)");
+                return Ok(None);
+            }
             "--data-dir" => dir = args.next(),
             "--listen" => listen = args.next(),
             "--tls-cert" => cert = args.next(),
             "--tls-key" => key = args.next(),
+            "--backup-key" => bkey = args.next(),
+            "--metrics" => metrics = args.next(),
+            "--metrics-token-file" => mtoken = args.next(),
+            "--no-binlog" => no_binlog = true,
+            "--restore" => restore = args.next(),
+            "--binlog-dir" => binlog_dir = args.next(),
+            "--until" => until = args.next(),
             _ => return Err(USAGE.into()),
         }
+    }
+    if let Some(file) = restore {
+        let dir = PathBuf::from(dir.ok_or(USAGE)?);
+        let kp = bkey.ok_or("--restore needs --backup-key FILE")?;
+        let k = ops::read_key(Path::new(&kp))?;
+        ops::restore(
+            &dir,
+            Path::new(&file),
+            &k,
+            binlog_dir.as_deref().map(Path::new),
+            until.as_deref(),
+        )?;
+        return Ok(None);
     }
     let data_dir = PathBuf::from(dir.ok_or(USAGE)?);
     let listen: SocketAddr = listen
@@ -233,15 +287,32 @@ fn parse_args() -> Result<Option<Config>, String> {
     if cert.is_some() != key.is_some() {
         return Err("--tls-cert and --tls-key go together".into());
     }
+    let metrics: Option<SocketAddr> = match metrics {
+        Some(m) => Some(m.parse().map_err(|e| format!("--metrics: {e}"))?),
+        None => None,
+    };
+    let metrics_token = match mtoken {
+        Some(p) => Some(
+            std::fs::read_to_string(&p)
+                .map_err(|e| format!("{p}: {e}"))?
+                .trim()
+                .to_string(),
+        ),
+        None => None,
+    };
     Ok(Some(Config {
         data_dir,
         listen,
         tls_cert: cert.map(PathBuf::from),
         tls_key: key.map(PathBuf::from),
+        backup_key: bkey.map(PathBuf::from),
+        metrics,
+        metrics_token,
+        no_binlog,
     }))
 }
 
-fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -405,13 +476,23 @@ fn run(cfg: Config) -> Result<(), String> {
     std::fs::create_dir_all(&cfg.data_dir).map_err(|e| format!("data dir: {e}"))?;
     std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| e.to_string())?;
+    let backup_key = ops::load_or_create_key(&cfg.data_dir, cfg.backup_key.as_deref())?;
     let mut engine = Engine::open(cfg.data_dir.join("db"))
         .map_err(|e| e.to_string())?
         .with_password_hasher(auth::hash_password);
+    if !cfg.no_binlog {
+        // Encrypted binary log for point-in-time recovery.
+        engine = engine
+            .with_binlog(&cfg.data_dir.join("binlog"), Some(backup_key))
+            .map_err(|e| e.to_string())?;
+    }
     bootstrap(&mut engine, &cfg.data_dir)?;
     let tls = tls_config(&cfg)?;
     let server = Arc::new(Server {
         engine: Arc::new(Mutex::new(engine)),
+        data_dir: cfg.data_dir.clone(),
+        backup_key,
+        metrics: ops::Metrics::default(),
         conns: Mutex::new(HashMap::new()),
         tls: TlsAcceptor::from(Arc::new(tls)),
         limiter: auth::RateLimiter::new(),
@@ -428,6 +509,16 @@ fn run(cfg: Config) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
+    if let Some(addr) = cfg.metrics {
+        if !addr.ip().is_loopback() && cfg.metrics_token.is_none() {
+            return Err("--metrics on a non-loopback address needs --metrics-token-file".into());
+        }
+        rt.spawn(ops::serve_metrics(
+            server.clone(),
+            addr,
+            cfg.metrics_token.clone(),
+        ));
+    }
     rt.block_on(serve(server.clone(), cfg.listen))?;
     rt.shutdown_timeout(Duration::from_secs(5));
     // Close the engine cleanly if no connection still holds it (otherwise WAL recovery on

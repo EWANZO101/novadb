@@ -5,6 +5,25 @@ All builds and tests run **inside Docker** (`novadb-builder`, `--cpus 2 --memory
 Toolchain: rustc 1.100.0 stable, nightly 2026-11-11 for cargo-fuzz; cargo-deny 0.20.2,
 cargo-audit 0.23.0, cargo-nextest 0.9.152.
 
+## 2026-11-18 — Stage 7 (operations: backups, binlog, PITR, metrics, packaging)
+Details: [docs/operations.md](docs/operations.md), [docs/mysql-pitfalls.md](docs/mysql-pitfalls.md).
+New deps: chacha20poly1305, getrandom (RustCrypto / permissive).
+
+| check | result |
+|---|---|
+| binlog unit tests: round trip, trim records newer than storage, torn tail, rotation, encrypted log (no clear text on disk, wrong/missing key refused) | ✅ |
+| backup format test: framing incl. 150 KB item, wrong/missing key, truncation and tampering detected | ✅ |
+| `tests/ops.rs`: backup while another session has an open txn → restore + full binlog replay == live DB (tables, rows, indexes, users, counters, DDL, rolled-back txn absent); `--until` == state at that moment; no data in clear in backup/binlog files | ✅ |
+| real server: `BACKUP DATABASE TO` online, refuses `../../etc/x` and non-root, files 0600; stop → `--restore … --binlog-dir` → new server answers identically incl. post-backup changes and users | ✅ |
+| metrics endpoint: counters for connections/logins/queries/errors, 404 elsewhere | ✅ |
+| parser refuses LOAD DATA / LOAD XML / INTO OUTFILE / DUMPFILE / CREATE FUNCTION…SONAME / INSTALL PLUGIN / triggers / procedures (1235); security-check: no LOCAL INFILE capability, no dynamic loading, no LOAD_FILE | ✅ |
+| `systemd-analyze verify packaging/novadb.service` | ✅ |
+| all earlier suites, clippy | ✅ |
+
+Found while building: metrics counters were defined but never incremented (caught on the live
+check); my own test bugs (probe row inserted after capturing the expected state; Docker volume
+owned by root) — the engine/server were right.
+
 ## 2026-11-18 — Stage 6 (joins, aggregates, subqueries, KILL)
 Details: [docs/sql.md](docs/sql.md) (Queries / Aggregates / Subqueries / Planner).
 

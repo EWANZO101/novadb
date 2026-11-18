@@ -9,6 +9,7 @@ use std::path::Path;
 use novadb_storage::{Db, MAX_KEY_LEN, MAX_VALUE_LEN, Options, Tree, Tx, Vfs};
 
 use crate::ast::*;
+use crate::binlog::{Binlog, LogOp, Record};
 use crate::catalog::{
     CATALOG_TREE, Column, Index, MAX_COLUMNS, MAX_INDEXES, Table, counter_key, table_key,
 };
@@ -106,6 +107,8 @@ pub struct Engine {
     manual: HashSet<u32>,
     /// Keys whose old versions were kept for a then-active snapshot.
     pending: HashSet<(Tree, Vec<u8>)>,
+    /// Binary log (point-in-time recovery), if enabled.
+    binlog: Option<Binlog>,
 }
 
 fn system_now() -> i64 {
@@ -125,6 +128,7 @@ impl Engine {
             txns: HashMap::new(),
             manual: HashSet::new(),
             pending: HashSet::new(),
+            binlog: None,
         })
     }
     pub fn open_vfs(vfs: Box<dyn Vfs>, opts: Options) -> Result<Engine> {
@@ -136,6 +140,7 @@ impl Engine {
             txns: HashMap::new(),
             manual: HashSet::new(),
             pending: HashSet::new(),
+            binlog: None,
         })
     }
     /// Replace the clock used by NOW()/CURRENT_TIMESTAMP (tests).
@@ -348,7 +353,9 @@ impl Engine {
             }
             Stmt::CreateUser { .. } | Stmt::AlterUser { .. } | Stmt::DropUser { .. } => {
                 self.commit_txn(conn)?;
-                self.user_stmt(s)
+                let r = self.user_stmt(s)?;
+                self.log_after(s)?;
+                Ok(r)
             }
             Stmt::CreateTable(_)
             | Stmt::DropTable { .. }
@@ -365,7 +372,9 @@ impl Engine {
                 } else {
                     // Old versions in dropped trees are gone; forget them.
                     self.pending.clear();
-                    self.exec_stmt(s, conn)
+                    let r = self.exec_stmt(s, conn)?;
+                    self.log_after(s)?;
+                    Ok(r)
                 }
             }
             _ => self.exec_stmt(s, conn),
@@ -421,11 +430,20 @@ impl Engine {
             return Ok(());
         }
         let snaps: Vec<u64> = self.txns.values().map(|t| t.snap).collect();
+        let now = (self.clock)();
         let mut tx = self.db.begin()?;
         let r = (|| {
             let cat = catalog(&mut tx)?;
-            mvcc::commit(&mut tx, &cat, &txn.ws, txn.snap, &snaps, &mut self.pending)?;
-            gc_pending(&mut tx, &snaps, &mut self.pending)
+            let ts = mvcc::commit(&mut tx, &cat, &txn.ws, txn.snap, &snaps, &mut self.pending)?;
+            gc_pending(&mut tx, &snaps, &mut self.pending)?;
+            if let Some(b) = self.binlog.as_mut() {
+                b.append(&Record {
+                    ts,
+                    wall_us: now,
+                    ops: txn.ws.log.clone(),
+                })?;
+            }
+            Ok(())
         })();
         match r {
             Ok(()) => Ok(tx.commit()?),
@@ -507,8 +525,15 @@ impl Engine {
                 };
                 let snaps: Vec<u64> = self.txns.values().map(|t| t.snap).collect();
                 if !ws.is_empty() {
-                    mvcc::commit(&mut tx, &cat, &ws, snap, &snaps, &mut self.pending)?;
+                    let ts = mvcc::commit(&mut tx, &cat, &ws, snap, &snaps, &mut self.pending)?;
                     gc_pending(&mut tx, &snaps, &mut self.pending)?;
+                    if let Some(b) = self.binlog.as_mut() {
+                        b.append(&Record {
+                            ts,
+                            wall_us: now,
+                            ops: std::mem::take(&mut ws.log),
+                        })?;
+                    }
                 }
                 Ok(r)
             })();
@@ -581,7 +606,7 @@ fn run_stmt(mv: &mut Mv<'_, '_>, s: &Stmt, now: i64) -> Result<QueryResult> {
             }
             insert(mv, table, cols.as_deref(), &rows, now)
         }
-        Stmt::Kill { .. } | Stmt::ShowProcesslist => Err(SqlError::unsupported(
+        Stmt::Kill { .. } | Stmt::ShowProcesslist | Stmt::Backup(_) => Err(SqlError::unsupported(
             "KILL / SHOW PROCESSLIST outside the server",
         )),
         Stmt::Select(sel) => select(mv, sel, now),
@@ -2029,6 +2054,11 @@ fn insert_row(mv: &mut Mv<'_, '_>, t: &Table, tr: &Trees, row: &[Value]) -> Resu
     let pk = if t.pk.is_empty() {
         let id = read_counter(mv.tx, &rowid_key(t.id), 1)?;
         write_counter(mv.tx, &rowid_key(t.id), id + 1)?;
+        mv.ws.log.push(LogOp::Counter {
+            table: t.name.clone(),
+            rowid: true,
+            value: id + 1,
+        });
         hidden_key(id)?
     } else {
         let k = pk_key(t, row)?;
@@ -2039,6 +2069,11 @@ fn insert_row(mv: &mut Mv<'_, '_>, t: &Table, tr: &Trees, row: &[Value]) -> Resu
     };
     index_insert(mv, t, tr, row, &pk)?;
     put_row(mv, tr, &pk, row)?;
+    mv.ws.log.push(LogOp::Put {
+        table: t.name.clone(),
+        key: pk.clone(),
+        row: row.to_vec(),
+    });
     Ok(pk)
 }
 
@@ -2149,6 +2184,11 @@ fn insert(
     }
     if let (Some(_), Some(ctr)) = (ai, counter) {
         write_counter(mv.tx, &counter_key(t.id), ctr)?;
+        mv.ws.log.push(LogOp::Counter {
+            table: t.name.clone(),
+            rowid: false,
+            value: ctr,
+        });
     }
     Ok(QueryResult {
         affected: n,
@@ -2289,9 +2329,18 @@ fn update(
                 return Err(SqlError::dup_entry(&render_key(&t.pk, &new), "PRIMARY"));
             }
             del_row(mv, &tr, &pk)?;
+            mv.ws.log.push(LogOp::Del {
+                table: t.name.clone(),
+                key: pk.clone(),
+            });
         }
         index_insert(mv, &t, &tr, &new, &new_pk)?;
         put_row(mv, &tr, &new_pk, &new)?;
+        mv.ws.log.push(LogOp::Put {
+            table: t.name.clone(),
+            key: new_pk.clone(),
+            row: new.clone(),
+        });
         changed += 1;
     }
     Ok(QueryResult {
@@ -2318,6 +2367,10 @@ fn delete(
     for (pk, row) in rows {
         index_delete(mv, &t, &tr, &row, &pk)?;
         del_row(mv, &tr, &pk)?;
+        mv.ws.log.push(LogOp::Del {
+            table: t.name.clone(),
+            key: pk.clone(),
+        });
     }
     Ok(QueryResult::ok(n))
 }
@@ -2797,4 +2850,326 @@ fn show_variables(like_pat: Option<&str>, status: bool) -> Result<QueryResult> {
         rows,
         ..Default::default()
     })
+}
+
+// ----- Stage 7: binary log, dumps, replay ----------------------------------------------------
+
+/// Rows of one dump batch and the primary key to continue after.
+pub type DumpBatch = (Vec<Vec<Value>>, Option<Vec<u8>>);
+
+impl Engine {
+    /// Enable the binary log in `dir` (records newer than the storage's last commit are
+    /// trimmed). `key`: optional 32-byte key — records are then encrypted (XChaCha20-Poly1305).
+    pub fn with_binlog(mut self, dir: &Path, key: Option<[u8; 32]>) -> Result<Self> {
+        let ts = self.last_ts()?;
+        self.binlog = Some(Binlog::open(dir, ts, key)?);
+        Ok(self)
+    }
+
+    /// Last committed timestamp.
+    pub fn last_ts(&mut self) -> Result<u64> {
+        let mut tx = self.db.begin()?;
+        let r = catalog(&mut tx).and_then(|c| mvcc::last_ts(&mut tx, &c));
+        tx.rollback();
+        r
+    }
+
+    /// Start a new binlog file (done at every backup).
+    pub fn rotate_binlog(&mut self) -> Result<()> {
+        match self.binlog.as_mut() {
+            Some(b) => b.rotate(),
+            None => Ok(()),
+        }
+    }
+
+    /// Log non-row changes (DDL, users) under a fresh timestamp.
+    fn log_now(&mut self, ops: Vec<LogOp>) -> Result<()> {
+        if self.binlog.is_none() || ops.is_empty() {
+            return Ok(());
+        }
+        let wall = (self.clock)();
+        let mut tx = self.db.begin()?;
+        let r = (|| {
+            let cat = catalog(&mut tx)?;
+            let ts = mvcc::last_ts(&mut tx, &cat)? + 1;
+            tx.put(&cat, mvcc::TS_KEY, &ts.to_le_bytes())?;
+            if let Some(b) = self.binlog.as_mut() {
+                b.append(&Record {
+                    ts,
+                    wall_us: wall,
+                    ops,
+                })?;
+            }
+            Ok(())
+        })();
+        match r {
+            Ok(()) => Ok(tx.commit()?),
+            Err(e) => {
+                tx.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Re-executable SQL for a DDL statement that just succeeded.
+    fn ddl_text(&mut self, s: &Stmt) -> Result<Option<String>> {
+        Ok(match s {
+            Stmt::CreateTable(c) => {
+                let mut tx = self.db.begin()?;
+                let r = show_create(&mut tx, &c.name);
+                tx.rollback();
+                let ddl = r?
+                    .rows
+                    .first()
+                    .and_then(|row| row.get(1))
+                    .and_then(Value::text)
+                    .unwrap_or_default();
+                Some(ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1))
+            }
+            Stmt::DropTable { names, .. } => Some(format!(
+                "DROP TABLE IF EXISTS {}",
+                names
+                    .iter()
+                    .map(|n| quote(n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Stmt::CreateIndex {
+                name,
+                table,
+                cols,
+                unique,
+            } => Some(format!(
+                "CREATE {}INDEX {} ON {} ({})",
+                if *unique { "UNIQUE " } else { "" },
+                quote(name),
+                quote(table),
+                cols.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ")
+            )),
+            Stmt::DropIndex { name, table } => {
+                Some(format!("DROP INDEX {} ON {}", quote(name), quote(table)))
+            }
+            _ => None,
+        })
+    }
+
+    fn log_after(&mut self, s: &Stmt) -> Result<()> {
+        if self.binlog.is_none() {
+            return Ok(());
+        }
+        let ops = match s {
+            Stmt::CreateUser { name, .. } | Stmt::AlterUser { name, .. } => {
+                vec![LogOp::User {
+                    name: name.to_lowercase(),
+                    hash: self.user_hash(name)?,
+                }]
+            }
+            Stmt::DropUser { names, .. } => names
+                .iter()
+                .map(|n| LogOp::User {
+                    name: n.to_lowercase(),
+                    hash: None,
+                })
+                .collect(),
+            _ => match self.ddl_text(s)? {
+                Some(sql) => vec![LogOp::Ddl(sql)],
+                None => vec![],
+            },
+        };
+        self.log_now(ops)
+    }
+
+    /// Begin a consistent dump: registers a snapshot for `conn` (old versions it needs are kept
+    /// until `end_session`). Returns the snapshot timestamp.
+    pub fn dump_begin(&mut self, conn: u32) -> Result<u64> {
+        self.commit_txn(conn)?;
+        self.begin_txn(conn)?;
+        Ok(self.txns.get(&conn).map_or(0, |t| t.snap))
+    }
+
+    /// Tables with their CREATE TABLE text and counters (AUTO_INCREMENT next, row-id next).
+    pub fn dump_tables(&mut self) -> Result<Vec<(String, String, u64)>> {
+        let mut tx = self.db.begin()?;
+        let r = (|| {
+            let names: Vec<String> = show_tables(&mut tx)?
+                .rows
+                .into_iter()
+                .filter_map(|r| r.into_iter().next())
+                .filter_map(|v| v.text())
+                .collect();
+            let mut out = Vec::new();
+            for n in names {
+                let t = load_table(&mut tx, &n)?;
+                let ddl = show_create(&mut tx, &n)?
+                    .rows
+                    .first()
+                    .and_then(|row| row.get(1))
+                    .and_then(Value::text)
+                    .unwrap_or_default();
+                let ai = if t.auto_inc_col().is_some() {
+                    read_counter(&mut tx, &counter_key(t.id), 1)?
+                } else {
+                    0
+                };
+                out.push((t.name.clone(), ddl, ai));
+            }
+            Ok(out)
+        })();
+        tx.rollback();
+        r
+    }
+
+    /// Next batch of rows of `table` at the dump snapshot of `conn`, after primary key `after`.
+    pub fn dump_rows(
+        &mut self,
+        conn: u32,
+        table: &str,
+        after: Option<&[u8]>,
+        n: usize,
+    ) -> Result<DumpBatch> {
+        let Some(txn) = self.txns.get_mut(&conn) else {
+            return Err(SqlError::internal("dump_rows without dump_begin"));
+        };
+        let mut tx = self.db.begin()?;
+        let r = (|| {
+            let t = load_table(&mut tx, table)?;
+            let tr = open_trees(&mut tx, &t)?;
+            let mut ws = WriteSet::default();
+            let mut mv = Mv {
+                tx: &mut tx,
+                snap: txn.snap,
+                ws: &mut ws,
+            };
+            let lo = match after {
+                Some(k) => std::ops::Bound::Excluded(k.to_vec()),
+                None => std::ops::Bound::Unbounded,
+            };
+            let b = mv.scan(&tr.rows, &lo, &std::ops::Bound::Unbounded, n)?;
+            let last = b.last().map(|(k, _)| k.clone());
+            let mut rows = Vec::with_capacity(b.len());
+            for (k, stored) in b {
+                rows.push(decode_stored(&mut mv, &tr, &k, &stored, t.cols.len())?);
+            }
+            Ok((rows, last))
+        })();
+        tx.rollback();
+        r
+    }
+
+    /// Set a table's AUTO_INCREMENT (or hidden row-id) counter to at least `value`.
+    pub fn set_counter(&mut self, table: &str, rowid: bool, value: u64) -> Result<()> {
+        let mut tx = self.db.begin()?;
+        let r = (|| {
+            let t = load_table(&mut tx, table)?;
+            let key = if rowid {
+                rowid_key(t.id)
+            } else {
+                counter_key(t.id)
+            };
+            let cur = read_counter(&mut tx, &key, 1)?;
+            if value > cur {
+                write_counter(&mut tx, &key, value)?;
+            }
+            Ok(())
+        })();
+        match r {
+            Ok(()) => Ok(tx.commit()?),
+            Err(e) => {
+                tx.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Apply one binary-log record (point-in-time recovery). Row changes of a record are
+    /// applied atomically; constraints were checked when the change was first made.
+    pub fn apply_record(&mut self, rec: &Record) -> Result<()> {
+        let mut rows: Vec<&LogOp> = Vec::new();
+        for op in &rec.ops {
+            match op {
+                LogOp::Ddl(sql) => {
+                    self.execute(sql)?;
+                }
+                LogOp::User { name, hash } => match hash {
+                    Some(h) => self.set_user_hash(name, h)?,
+                    None => {
+                        let k = name.to_lowercase();
+                        self.db.update(|tx| {
+                            let t = tx.open_or_create_tree(USERS_TREE)?;
+                            tx.delete(&t, k.as_bytes()).map(|_| ())
+                        })?;
+                    }
+                },
+                LogOp::Counter {
+                    table,
+                    rowid,
+                    value,
+                } => self.set_counter(table, *rowid, *value)?,
+                LogOp::Put { .. } | LogOp::Del { .. } => rows.push(op),
+            }
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.begin()?;
+        let r = (|| {
+            let cat = catalog(&mut tx)?;
+            let snap = mvcc::last_ts(&mut tx, &cat)?;
+            let mut ws = WriteSet::default();
+            {
+                let mut mv = Mv {
+                    tx: &mut tx,
+                    snap,
+                    ws: &mut ws,
+                };
+                let mut cache: HashMap<String, (Table, Trees)> = HashMap::new();
+                for op in rows {
+                    let (table, key) = match op {
+                        LogOp::Put { table, key, .. } | LogOp::Del { table, key } => (table, key),
+                        _ => continue,
+                    };
+                    if !cache.contains_key(table) {
+                        let t = load_table(mv.tx, table)?;
+                        let tr = open_trees(mv.tx, &t)?;
+                        cache.insert(table.to_string(), (t, tr));
+                    }
+                    let Some((t, tr)) = cache.get(table) else {
+                        continue;
+                    };
+                    if let Some(old) = get_row(&mut mv, tr, key, t.cols.len())? {
+                        index_delete(&mut mv, t, tr, &old, key)?;
+                        del_row(&mut mv, tr, key)?;
+                    }
+                    if let LogOp::Put { row, .. } = op {
+                        if row.len() != t.cols.len() {
+                            return Err(SqlError::corrupt(
+                                "binlog row does not match the table definition",
+                            ));
+                        }
+                        index_insert(&mut mv, t, tr, row, key)?;
+                        put_row(&mut mv, tr, key, row)?;
+                    }
+                }
+            }
+            mvcc::commit(&mut tx, &cat, &ws, snap, &[], &mut self.pending)?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => Ok(tx.commit()?),
+            Err(e) => {
+                tx.rollback();
+                Err(e)
+            }
+        }
+    }
+}
+
+/// SQL literal for a value (dumps).
+pub fn sql_value(v: &Value) -> String {
+    sql_literal(v)
+}
+
+/// Backtick-quoted identifier (dumps).
+pub fn sql_ident(n: &str) -> String {
+    quote(n)
 }

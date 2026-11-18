@@ -319,7 +319,38 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Set(v))
     }
 
+    /// Features that give SQL access to files or native code are not implemented on purpose
+    /// (MySQL: LOAD DATA [LOCAL] INFILE, SELECT … INTO OUTFILE/DUMPFILE, LOAD_FILE(), UDFs via
+    /// CREATE FUNCTION … SONAME, INSTALL PLUGIN). Refuse them with a clear message.
+    fn refuse_file_and_code_features(&self) -> Result<()> {
+        let kw = |i: usize, w: &str| self.is_kw_at(i, w);
+        let reason = if kw(0, "load") && (kw(1, "data") || kw(1, "xml")) {
+            Some("LOAD DATA / LOAD XML (NovaDB never reads server or client files from SQL)")
+        } else if kw(0, "install") || kw(0, "uninstall") {
+            Some("INSTALL/UNINSTALL PLUGIN (no native-code loading)")
+        } else if kw(0, "create")
+            && (kw(1, "function") || kw(1, "aggregate") || kw(1, "procedure") || kw(1, "trigger"))
+        {
+            Some("CREATE FUNCTION / PROCEDURE / TRIGGER (no user-defined native code)")
+        } else {
+            None
+        };
+        match reason {
+            Some(r) => Err(SqlError::unsupported(r)),
+            None => Ok(()),
+        }
+    }
+
     fn statement(&mut self) -> Result<Stmt> {
+        self.refuse_file_and_code_features()?;
+        if self.eat_kw("backup") {
+            let _ = self.eat_kw("database");
+            self.kw("to")?;
+            return match self.bump() {
+                Tok::Str(name) => Ok(Stmt::Backup(name)),
+                _ => Err(self.err("expected a backup name string")),
+            };
+        }
         if self.eat_kw("kill") {
             let query_only = if self.eat_kw("query") {
                 true
@@ -922,6 +953,11 @@ impl<'a> Parser<'a> {
         let (limit, offset) = self.limit_offset(true)?;
         if self.is_kw("union") {
             return Err(SqlError::unsupported("UNION"));
+        }
+        if self.is_kw("into") {
+            return Err(SqlError::unsupported(
+                "SELECT ... INTO OUTFILE/DUMPFILE/@var (NovaDB never writes files from SQL)",
+            ));
         }
         if self.is_kw("for") || self.is_kw("lock") {
             return Err(SqlError::unsupported(
@@ -1557,6 +1593,30 @@ mod tests {
         assert!(matches!(one("SHOW DATABASES"), Stmt::ShowDatabases));
         assert!(matches!(
             one("SELECT @@version_comment LIMIT 1"),
+            Stmt::Select(_)
+        ));
+    }
+
+    #[test]
+    fn file_and_native_code_features_are_refused() {
+        for sql in [
+            "LOAD DATA INFILE '/etc/passwd' INTO TABLE t",
+            "LOAD DATA LOCAL INFILE '/home/u/.ssh/id_rsa' INTO TABLE t",
+            "LOAD XML INFILE 'x' INTO TABLE t",
+            "SELECT * FROM t INTO OUTFILE '/var/www/shell.php'",
+            "SELECT 1 INTO DUMPFILE '/tmp/x'",
+            "CREATE FUNCTION sys_exec RETURNS INT SONAME 'lib_mysqludf_sys.so'",
+            "CREATE AGGREGATE FUNCTION f RETURNS INT SONAME 'x.so'",
+            "INSTALL PLUGIN x SONAME 'x.so'",
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW SET @a = 1",
+            "CREATE PROCEDURE p() SELECT 1",
+        ] {
+            let e = parse(sql).unwrap_err();
+            assert_eq!(e.code, 1235, "{sql}: {e}");
+        }
+        // LOAD_FILE() is simply an unknown function.
+        assert!(matches!(
+            one("SELECT LOAD_FILE('/etc/passwd')"),
             Stmt::Select(_)
         ));
     }

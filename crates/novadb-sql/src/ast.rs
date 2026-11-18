@@ -41,6 +41,8 @@ pub enum Stmt {
         limit: Option<u64>,
     },
     ShowTables,
+    /// BACKUP DATABASE TO 'name' — handled by the server (root only, into <data>/backups).
+    Backup(String),
     /// SHOW [FULL] PROCESSLIST — handled by the server.
     ShowProcesslist,
     /// KILL [CONNECTION | QUERY] id — handled by the server.

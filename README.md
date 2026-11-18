@@ -5,7 +5,9 @@ Rust database engine aiming for MySQL/MariaDB wire compatibility. Everything is 
 **Status:** Stage 1 (workspace, CI, policies), Stage 2 (storage engine), Stage 3 (single-node
 SQL, [docs/sql.md](docs/sql.md)) and Stage 4 (MySQL wire protocol over TLS,
 [docs/protocol.md](docs/protocol.md)) Stage 5 (MVCC transactions, snapshot isolation,
-[docs/transactions.md](docs/transactions.md)) and Stage 6 (joins, aggregates, subqueries) done — see
+[docs/transactions.md](docs/transactions.md)) Stage 6 (joins, aggregates, subqueries) and Stage 7 (encrypted backups + binary log,
+point-in-time recovery, metrics, hardened systemd/Docker — [docs/operations.md](docs/operations.md)) done.
+How NovaDB avoids MySQL's known problems: [docs/mysql-pitfalls.md](docs/mysql-pitfalls.md) — see
 [TESTING.md](TESTING.md) and [docs/storage.md](docs/storage.md). Stage 9 control dashboard +
 identity started early (2026-11-18) — see [docs/dashboard.md](docs/dashboard.md). Not production-ready. No
 compatibility or performance claims until the matching test suites pass.

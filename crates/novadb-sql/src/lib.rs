@@ -16,6 +16,8 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod backup;
+pub mod binlog;
 pub mod catalog;
 pub mod codec;
 pub mod error;

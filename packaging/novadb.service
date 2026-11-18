@@ -1,0 +1,57 @@
+# NovaDB server — hardened systemd unit.
+# Install: copy novadb-server to /usr/local/bin, `useradd -r -s /usr/sbin/nologin -d /var/lib/novadb novadb`,
+# then `systemctl enable --now novadb`. First start writes the one-time root password and the
+# backup/binlog encryption key into /var/lib/novadb (0600) — move the key OFF the server.
+[Unit]
+Description=NovaDB database server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=novadb
+Group=novadb
+ExecStart=/usr/local/bin/novadb-server --data-dir /var/lib/novadb --listen 127.0.0.1:3307 --metrics 127.0.0.1:9104
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+UMask=0077
+
+# Resource caps (adjust to the host)
+MemoryMax=4G
+TasksMax=512
+
+# Sandboxing
+StateDirectory=novadb
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/novadb
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @debug @module @raw-io @obsolete
+
+[Install]
+WantedBy=multi-user.target

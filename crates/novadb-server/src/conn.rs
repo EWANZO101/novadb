@@ -103,6 +103,7 @@ pub async fn handle(server: Arc<Server>, tcp: TcpStream, peer: SocketAddr, conn_
         info: std::sync::Mutex::new(None),
     });
     server.register(conn_id, info);
+    crate::ops::Metrics::inc(&server.metrics.connections_total);
     let r = command_loop(
         &server,
         &mut tls,
@@ -196,6 +197,7 @@ async fn handshake(
     );
     if !lim_ip || !lim_user {
         eprintln!("[novadb] auth rate-limited for '{user}' from {ip}");
+        crate::ops::Metrics::inc(&server.metrics.auth_rate_limited);
         let mut w = Writer::new(seq);
         w.push(&pk::err(
             1129,
@@ -208,6 +210,7 @@ async fn handshake(
     let ok = server.verify(&user, password).await;
     if !ok {
         eprintln!("[novadb] auth failed for '{user}' from {ip}");
+        crate::ops::Metrics::inc(&server.metrics.auth_failures);
         deny(&mut tls, seq, &user).await?;
         return Ok(None);
     }
@@ -233,7 +236,7 @@ struct Prepared {
 }
 
 async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
-    server: &Server,
+    server: &Arc<Server>,
     s: &mut S,
     mut sess: Session,
     caps: u32,
@@ -327,6 +330,9 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                                 ),
                                 Stmt::ShowProcesslist => {
                                     (Ok(server.processlist(&sess.user)), status)
+                                }
+                                Stmt::Backup(name) => {
+                                    (crate::ops::backup(server, &sess.user, name).await, status)
                                 }
                                 _ => server.run(st, &mut sess).await,
                             };

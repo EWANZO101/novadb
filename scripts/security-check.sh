@@ -35,6 +35,12 @@ fi
 if grep -rni 'mysql_native_password' crates --include=*.rs; then bad "mysql_native_password referenced"; else ok "no mysql_native_password"; fi
 if grep -rni 'sha1' crates --include=*.rs | grep -v '^crates/novadb-dashboard/src/totp.rs:'; then bad "SHA1 used outside TOTP"; else ok "SHA1 only in TOTP (RFC 6238)"; fi
 
+# no file access / native code from SQL (MySQL secure_file_priv, LOCAL INFILE and UDF risks)
+if grep -n 'CLIENT_LOCAL_FILES\|0x80 *|' crates/novadb-protocol/src/packets.rs | grep -v '^.*//' ; then bad "LOCAL INFILE capability referenced"; else ok "server never offers LOCAL INFILE (CLIENT_LOCAL_FILES)"; fi
+grep -q 'fn refuse_file_and_code_features' crates/novadb-sql/src/parser.rs && ok "parser refuses LOAD DATA / INTO OUTFILE / UDF / plugins" || bad "file/native-code refusal missing"
+if grep -rnE 'dlopen|libloading|load_library' crates --include=*.rs; then bad "dynamic library loading found"; else ok "no dynamic library loading"; fi
+if grep -rn '"load_file"' crates/novadb-sql/src --include=*.rs; then bad "LOAD_FILE implemented"; else ok "no LOAD_FILE()"; fi
+
 # no secrets committed
 FILES=$(git ls-files) || { bad "git ls-files failed"; FILES=""; }
 if echo "$FILES" | grep -E '(^|/)\.env$|\.pem$|\.key$|id_rsa'; then bad "secret-looking files tracked"; else ok "no secret files tracked"; fi
