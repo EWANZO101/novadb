@@ -18,6 +18,8 @@ pub const MAX_ROWS: usize = 1000;
 pub const MAX_SQL: usize = 64 * 1024;
 /// Most statements per console run.
 pub const MAX_STMTS: usize = 50;
+/// Default SELECT time limit per statement (ms). Only admins may change it.
+pub const MAX_EXEC_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -44,6 +46,8 @@ pub fn classify(s: &Stmt) -> Kind {
             Kind::Forbidden => Kind::Forbidden,
             _ => Kind::Read,
         },
+        // Lifting the time limit is a privileged change (it can tie up the workspace).
+        Stmt::Set(v) if v.iter().any(|(n, _)| n == "max_execution_time") => Kind::Write,
         Stmt::Txn(_) | Stmt::Set(_) | Stmt::Use(_) => Kind::Control,
         Stmt::CreateUser { .. } | Stmt::AlterUser { .. } | Stmt::DropUser { .. } => Kind::Forbidden,
         _ => Kind::Write,
@@ -96,6 +100,7 @@ impl SqlShared {
                 user: "dashboard".into(),
                 conn_id: conn,
                 last_insert_id: 0,
+                max_execution_ms: MAX_EXEC_MS,
             };
             let r = f(e, &mut sess);
             e.end_session(conn);
@@ -264,6 +269,8 @@ mod tests {
         assert_eq!(k("DELETE FROM t"), Kind::Write);
         assert_eq!(k("CREATE TABLE t (a INT)"), Kind::Write);
         assert_eq!(k("BEGIN"), Kind::Control);
+        assert_eq!(k("SET autocommit = 0"), Kind::Control);
+        assert_eq!(k("SET max_execution_time = 0"), Kind::Write);
         assert_eq!(
             k("CREATE USER x IDENTIFIED BY 'long-password-123'"),
             Kind::Forbidden

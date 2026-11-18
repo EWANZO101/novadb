@@ -5,7 +5,6 @@ use super::*;
 use crate::sqlws::{self, Kind, Outcome, SqlShared};
 
 const BROWSE_PAGE: usize = 50;
-const COUNT_CAP: usize = 100_000;
 
 fn ws(app: &App) -> Result<&SqlShared, Response> {
     app.sql.as_ref().ok_or_else(|| {
@@ -128,13 +127,11 @@ async fn table_list(sql: &SqlShared) -> Result<Vec<TableInfo>, String> {
                     .and_then(|v| e.run_in(&v[0], s).map_err(|x| x.to_string()))
             };
             let cols = run(e, s, &format!("DESCRIBE `{n}`"))?.rows.len();
-            let rows = run(
-                e,
-                s,
-                &format!("SELECT * FROM `{n}` LIMIT {}", COUNT_CAP + 1),
-            )?
-            .rows
-            .len();
+            // COUNT(*) since Stage 6.
+            let rows = run(e, s, &format!("SELECT COUNT(*) FROM `{n}`"))?
+                .text(0, 0)
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
             out.push(TableInfo {
                 name: n,
                 cols,
@@ -147,10 +144,10 @@ async fn table_list(sql: &SqlShared) -> Result<Vec<TableInfo>, String> {
 }
 
 fn count_txt(n: usize) -> String {
-    if n > COUNT_CAP {
-        format!("{}k+", COUNT_CAP / 1000)
-    } else {
-        n.to_string()
+    match n {
+        0..=9_999 => n.to_string(),
+        10_000..=999_999 => format!("{:.1}k", n as f64 / 1000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
     }
 }
 
@@ -230,6 +227,10 @@ async fn db_render(
         ("Show tables", "SHOW TABLES"),
         ("Server version", "SELECT VERSION(), NOW()"),
         (
+            "Join + group",
+            "SELECT c.name, COUNT(o.id) AS orders, SUM(o.total) AS spent\nFROM customers c LEFT JOIN orders o ON o.customer_id = c.id\nGROUP BY c.name\nORDER BY spent DESC",
+        ),
+        (
             "New table",
             "CREATE TABLE notes (\n  id INT PRIMARY KEY AUTO_INCREMENT,\n  body TEXT NOT NULL,\n  created_at DATETIME DEFAULT CURRENT_TIMESTAMP\n)",
         ),
@@ -273,7 +274,7 @@ async fn db_render(
 <form method="post" action="/databases/query" class="console">{csrf}
 <textarea name="sql" rows="9" spellcheck="false" autocapitalize="off" maxlength="{max}" placeholder="SELECT * FROM customers LIMIT 10;" aria-label="SQL" required autofocus>{pre}</textarea>
 <div class="between"><div class="chips">{snippets}</div><div class="row"><button name="format" value="csv" class="ghost sm">{idl}CSV</button><button class="sm">{iplay}Run</button></div></div></form>
-<div class="card-f">Separate statements with <code>;</code>. Each run is its own connection: an unfinished <code>BEGIN</code> is rolled back. Results show the first {maxrows} rows. Every query is written to the audit log.</div></div>
+<div class="card-f">Separate statements with <code>;</code>. Each run is its own connection: an unfinished <code>BEGIN</code> is rolled back. Results show the first {maxrows} rows; a SELECT may run {maxsec} s. Every query is written to the audit log.</div></div>
 {results}</div></div>"#,
         head = html::header(
             "Databases",
@@ -294,6 +295,7 @@ async fn db_render(
         csrf = csrf(&c.sess.csrf),
         max = sqlws::MAX_SQL,
         maxrows = sqlws::MAX_ROWS,
+        maxsec = sqlws::MAX_EXEC_MS / 1000,
         pre = esc(sql_text),
     );
     Ok(Html(html::page(
